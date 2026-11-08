@@ -1,4 +1,3 @@
-import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Dialog,
@@ -14,11 +13,15 @@ import Checkbox from '@/components/ui/Checkbox'
 interface PropertyEditDialogProps {
   isOpen: boolean
   onClose: () => void
-  onSave: (value: string, options?: { allowMerge?: boolean }) => void
+  onSave: () => void | Promise<void>
   propertyName: string
-  initialValue: string
+  value: string
+  allowMerge: boolean
+  onValueChange: (value: string) => void
+  onAllowMergeChange: (allowMerge: boolean) => void
   isSubmitting?: boolean
   errorMessage?: string | null
+  disableSave?: boolean
 }
 
 /**
@@ -30,21 +33,15 @@ const PropertyEditDialog = ({
   onClose,
   onSave,
   propertyName,
-  initialValue,
+  value,
+  allowMerge,
+  onValueChange,
+  onAllowMergeChange,
   isSubmitting = false,
-  errorMessage = null
+  errorMessage = null,
+  disableSave = false
 }: PropertyEditDialogProps) => {
   const { t } = useTranslation()
-  const [value, setValue] = useState('')
-  const [allowMerge, setAllowMerge] = useState(false)
-
-  // Initialize value when dialog opens
-  useEffect(() => {
-    if (isOpen) {
-      setValue(initialValue)
-      setAllowMerge(false)
-    }
-  }, [isOpen, initialValue])
 
   // Get translated property name
   const getPropertyNameTranslation = (name: string) => {
@@ -56,44 +53,36 @@ const PropertyEditDialog = ({
   // Get textarea configuration based on property name
   const getTextareaConfig = (propertyName: string) => {
     switch (propertyName) {
-    case 'description':
-      return {
+      case 'description':
+        return {
         // No rows attribute for description to allow auto-sizing
-        className: 'max-h-[50vh] min-h-[10em] resize-y', // Maximum height 70% of viewport, minimum height ~20 lines, allow vertical resizing
-        style: {
-          height: '70vh', // Set initial height to 70% of viewport
-          minHeight: '20em', // Minimum height ~20 lines
-          resize: 'vertical' as const // Allow vertical resizing, using 'as const' to fix type
-        }
-      };
-    case 'entity_id':
-      return {
-        rows: 2,
-        className: '',
-        style: {}
-      };
-    case 'keywords':
-      return {
-        rows: 4,
-        className: '',
-        style: {}
-      };
-    default:
-      return {
-        rows: 5,
-        className: '',
-        style: {}
-      };
+          className: 'max-h-[50vh] min-h-[10em] resize-y', // Maximum height 70% of viewport, minimum height ~20 lines, allow vertical resizing
+          style: {
+            height: '70vh', // Set initial height to 70% of viewport
+            minHeight: '20em', // Minimum height ~20 lines
+            resize: 'vertical' as const // Allow vertical resizing, using 'as const' to fix type
+          }
+        };
+      case 'entity_id':
+        return {
+          rows: 2,
+          className: '',
+          style: {}
+        };
+      case 'keywords':
+        return {
+          rows: 4,
+          className: '',
+          style: {}
+        };
+      default:
+        return {
+          rows: 5,
+          className: '',
+          style: {}
+        };
     }
   };
-
-  const handleSave = async () => {
-    const trimmedValue = value.trim()
-    if (trimmedValue !== '') {
-      const options = propertyName === 'entity_id' ? { allowMerge } : undefined
-      await onSave(trimmedValue, options)
-    }
-  }
 
   return (
     <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
@@ -109,6 +98,13 @@ const PropertyEditDialog = ({
           </DialogDescription>
         </DialogHeader>
 
+        {/* Pipeline busy banner: editing kept open with draft preserved, but save disabled */}
+        {disableSave && (
+          <div className="bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300 border border-amber-400/60 px-3 py-2 rounded-md text-sm">
+            {t('graphPanel.propertiesView.editLockedByPipeline')}
+          </div>
+        )}
+
         {/* Display error message if save fails */}
         {errorMessage && (
           <div className="bg-destructive/15 text-destructive px-4 py-2 rounded-md text-sm">
@@ -123,7 +119,7 @@ const PropertyEditDialog = ({
             return propertyName === 'description' ? (
               <textarea
                 value={value}
-                onChange={(e) => setValue(e.target.value)}
+                onChange={(e) => onValueChange(e.target.value)}
                 className={`border-input focus-visible:ring-ring flex w-full rounded-md border bg-transparent px-3 py-2 text-sm shadow-sm transition-colors focus-visible:ring-1 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 ${config.className}`}
                 style={config.style}
                 disabled={isSubmitting}
@@ -131,7 +127,7 @@ const PropertyEditDialog = ({
             ) : (
               <textarea
                 value={value}
-                onChange={(e) => setValue(e.target.value)}
+                onChange={(e) => onValueChange(e.target.value)}
                 rows={config.rows}
                 className={`border-input focus-visible:ring-ring flex w-full rounded-md border bg-transparent px-3 py-2 text-sm shadow-sm transition-colors focus-visible:ring-1 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 ${config.className}`}
                 disabled={isSubmitting}
@@ -147,7 +143,7 @@ const PropertyEditDialog = ({
                 id="allow-merge"
                 checked={allowMerge}
                 disabled={isSubmitting}
-                onCheckedChange={(checked) => setAllowMerge(checked === true)}
+                onCheckedChange={(checked) => onAllowMergeChange(checked === true)}
               />
               <div>
                 <span>{t('graphPanel.propertiesView.mergeOptionLabel')}</span>
@@ -170,8 +166,8 @@ const PropertyEditDialog = ({
           </Button>
           <Button
             type="button"
-            onClick={handleSave}
-            disabled={isSubmitting}
+            onClick={onSave}
+            disabled={isSubmitting || disableSave}
           >
             {isSubmitting ? (
               <>

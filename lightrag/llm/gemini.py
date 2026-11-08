@@ -9,9 +9,8 @@ implementation mirrors the OpenAI helpers while relying on the official
 
 from __future__ import annotations
 
-import asyncio
-import logging
 import os
+import warnings
 from collections.abc import AsyncIterator
 from functools import lru_cache
 from typing import Any
@@ -21,10 +20,15 @@ from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential,
+    retry_if_exception,
     retry_if_exception_type,
 )
 
+from lightrag.exceptions import EmptyTruncatedResponseError
 from lightrag.utils import (
+    TruncatedResponse,
+    empty_length_truncated_hint,
+    format_response_diagnostics,
     logger,
     remove_think_tags,
     safe_unicode_decode,
@@ -41,17 +45,61 @@ if not pm.is_installed("google-api-core"):
 
 from google import genai  # type: ignore
 from google.genai import types  # type: ignore
+from google.genai import errors as google_genai_errors  # type: ignore
 from google.api_core import exceptions as google_api_exceptions  # type: ignore
-
-DEFAULT_GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com"
-
-LOG = logging.getLogger(__name__)
 
 
 class InvalidResponseError(Exception):
     """Custom exception class for triggering retry mechanism when Gemini returns empty responses"""
 
     pass
+
+
+def _is_retryable_gemini_client_error(exc: BaseException) -> bool:
+    """True for a rate-limit response, the one 4xx worth a fresh attempt.
+
+    ``google-genai`` (the client this module actually calls through
+    ``client.aio.models.*``) raises its own ``google.genai.errors``
+    hierarchy, not ``google.api_core.exceptions`` -- that module belongs to
+    the older Vertex AI client libraries and is never raised on this
+    request path. Its 5xx failures surface as ``ServerError``, matched
+    directly in the retry predicate below. A 429 rate-limit response,
+    however, surfaces as the generic 4xx ``ClientError`` rather than a
+    distinct "resource exhausted" type, so it must be matched by status
+    code; every other ``ClientError`` (bad request, bad auth, not found)
+    stays non-retryable.
+    """
+    return (
+        isinstance(exc, google_genai_errors.ClientError)
+        and getattr(exc, "code", None) == 429
+    )
+
+
+_DEFAULT_GEMINI_BASE_URLS = {
+    "https://generativelanguage.googleapis.com",
+    "https://generativelanguage.googleapis.com/",
+    "https://generativelanguage.googleapis.com/v1beta",
+    "https://generativelanguage.googleapis.com/v1beta/",
+    "https://generativelanguage.googleapis.com/v1",
+    "https://generativelanguage.googleapis.com/v1/",
+}
+
+
+def _normalize_gemini_base_url(base_url: str | None) -> str | None:
+    """Treat Google's default Gemini API service roots as SDK defaults."""
+    if not base_url:
+        return None
+
+    normalized = base_url.strip()
+    if not normalized or normalized == "DEFAULT_GEMINI_ENDPOINT":
+        return None
+
+    if normalized.rstrip("/") in {
+        service_root.rstrip("/") for service_root in _DEFAULT_GEMINI_BASE_URLS
+    }:
+        return None
+
+    return normalized
 
 
 @lru_cache(maxsize=8)
@@ -62,36 +110,58 @@ def _get_gemini_client(
     Create (or fetch cached) Gemini client.
 
     Args:
-        api_key: Google Gemini API key.
+        api_key: Google Gemini API key (not used in Vertex AI mode).
         base_url: Optional custom API endpoint.
         timeout: Optional request timeout in milliseconds.
 
     Returns:
         genai.Client: Configured Gemini client instance.
     """
-    client_kwargs: dict[str, Any] = {"api_key": api_key}
+    client_kwargs: dict[str, Any] = {}
+    normalized_base_url = _normalize_gemini_base_url(base_url)
 
-    if base_url and base_url != DEFAULT_GEMINI_ENDPOINT or timeout is not None:
+    # Add Vertex AI support
+    use_vertexai = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").lower() == "true"
+    if use_vertexai:
+        # Vertex AI mode: use project/location, NOT api_key
+        client_kwargs["vertexai"] = True
+        project = os.getenv("GOOGLE_CLOUD_PROJECT")
+        if project:
+            location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+            client_kwargs["project"] = project
+            if location:
+                client_kwargs["location"] = location
+        else:
+            raise ValueError(
+                "GOOGLE_CLOUD_PROJECT must be set when using Vertex AI mode"
+            )
+    else:
+        # Standard Gemini API mode: use api_key
+        client_kwargs["api_key"] = api_key
+
+    if normalized_base_url is not None or timeout is not None:
         try:
             http_options_kwargs = {}
-            if base_url and base_url != DEFAULT_GEMINI_ENDPOINT:
-                http_options_kwargs["api_endpoint"] = base_url
+            if normalized_base_url is not None:
+                http_options_kwargs["base_url"] = normalized_base_url
             if timeout is not None:
                 http_options_kwargs["timeout"] = timeout
 
             client_kwargs["http_options"] = types.HttpOptions(**http_options_kwargs)
-        except Exception as exc:  # pragma: no cover - defensive
-            LOG.warning("Failed to apply custom Gemini http_options: %s", exc)
+        except Exception as e:
+            logger.error("Failed to apply custom Gemini http_options: %s", e)
+            raise e
 
-    try:
-        return genai.Client(**client_kwargs)
-    except TypeError:
-        # Older google-genai releases don't accept http_options; retry without it.
-        client_kwargs.pop("http_options", None)
-        return genai.Client(**client_kwargs)
+    return genai.Client(**client_kwargs)
 
 
 def _ensure_api_key(api_key: str | None) -> str:
+    # In Vertex AI mode, API key is not required
+    use_vertexai = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").lower() == "true"
+    if use_vertexai:
+        # Return empty string for Vertex AI mode (not used)
+        return ""
+
     key = api_key or os.getenv("LLM_BINDING_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not key:
         raise ValueError(
@@ -104,7 +174,7 @@ def _ensure_api_key(api_key: str | None) -> str:
 def _build_generation_config(
     base_config: dict[str, Any] | None,
     system_prompt: str | None,
-    keyword_extraction: bool,
+    response_format: Any | None,
 ) -> types.GenerateContentConfig | None:
     config_data = dict(base_config or {})
 
@@ -116,8 +186,12 @@ def _build_generation_config(
         else:
             config_data["system_instruction"] = system_prompt
 
-    if keyword_extraction and not config_data.get("response_mime_type"):
-        config_data["response_mime_type"] = "application/json"
+    # Translate response_format to Gemini's native generation config fields.
+    if response_format is not None:
+        config_data.setdefault("response_mime_type", "application/json")
+        schema = _normalize_gemini_response_schema(response_format)
+        if schema is not None and "response_json_schema" not in config_data:
+            config_data["response_json_schema"] = schema
 
     # Remove entries that are explicitly set to None to avoid type errors
     sanitized = {
@@ -130,6 +204,39 @@ def _build_generation_config(
         return None
 
     return types.GenerateContentConfig(**sanitized)
+
+
+def _normalize_gemini_response_schema(response_format: Any) -> Any | None:
+    """Extract a Gemini-compatible JSON schema from LightRAG/OpenAI inputs."""
+    if response_format is None:
+        return None
+
+    if isinstance(response_format, dict):
+        if response_format.get("type") == "json_object":
+            return None
+
+        if response_format.get("type") == "json_schema":
+            json_schema = response_format.get("json_schema")
+            if isinstance(json_schema, dict):
+                schema = json_schema.get("schema")
+                if isinstance(schema, dict):
+                    return schema
+                return json_schema
+
+        return response_format
+
+    return response_format
+
+
+def _validate_gemini_response_format(response_format: Any | None) -> None:
+    """Reject typed structured-output helpers; only dict payloads are supported."""
+    if response_format is None or isinstance(response_format, dict):
+        return
+
+    raise TypeError(
+        "gemini_complete_if_cache only supports dict response_format payloads; "
+        "typed/Pydantic response_format values are not supported."
+    )
 
 
 def _format_history_messages(history_messages: list[dict[str, Any]] | None) -> str:
@@ -197,6 +304,8 @@ def _extract_response_text(
         | retry_if_exception_type(google_api_exceptions.DeadlineExceeded)
         | retry_if_exception_type(google_api_exceptions.Aborted)
         | retry_if_exception_type(google_api_exceptions.Unknown)
+        | retry_if_exception_type(google_genai_errors.ServerError)
+        | retry_if_exception(_is_retryable_gemini_client_error)
         | retry_if_exception_type(InvalidResponseError)
     ),
 )
@@ -210,9 +319,13 @@ async def gemini_complete_if_cache(
     api_key: str | None = None,
     token_tracker: Any | None = None,
     stream: bool | None = None,
+    response_format: Any | None = None,
     keyword_extraction: bool = False,
+    entity_extraction: bool = False,
     generation_config: dict[str, Any] | None = None,
     timeout: int | None = None,
+    image_inputs: list[Any] | None = None,
+    max_tokens: int | None = None,
     **_: Any,
 ) -> str | AsyncIterator[str]:
     """
@@ -220,6 +333,19 @@ async def gemini_complete_if_cache(
 
     This function supports automatic integration of reasoning content from Gemini models
     that provide Chain of Thought capabilities via the thinking_config API feature.
+
+    Structured output note:
+    - This adapter accepts OpenAI-style ``response_format`` and translates it
+      to Gemini's native generation config fields.
+    - ``response_format={"type": "json_object"}`` maps to
+      ``response_mime_type="application/json"``.
+    - Dict-form ``json_schema`` payloads map to
+      ``response_mime_type="application/json"`` plus
+      ``response_json_schema=<schema>``.
+    - Typed/Pydantic ``response_format`` helpers are rejected explicitly.
+    - Deprecated ``keyword_extraction`` and ``entity_extraction`` booleans are
+      compatibility shims; when no explicit ``response_format`` is supplied,
+      they are mapped to ``{"type": "json_object"}``.
 
     COT Integration:
     - When enable_cot=True: Thought content is wrapped in <think>...</think> tags
@@ -235,12 +361,19 @@ async def gemini_complete_if_cache(
         api_key: Optional Gemini API key. If None, uses environment variable.
         base_url: Optional custom API endpoint.
         generation_config: Optional generation configuration dict.
-        keyword_extraction: Whether to use JSON response format.
+        response_format: OpenAI-style structured output control translated to
+            Gemini generation config. ``{"type": "json_object"}`` maps to
+            ``response_mime_type="application/json"``; dict-form
+            ``json_schema`` payloads map to ``response_json_schema``.
+            Typed/Pydantic response_format values are rejected.
         token_tracker: Optional token usage tracker for monitoring API usage.
         stream: Whether to stream the response.
         hashing_kv: Storage interface (for interface parity with other bindings).
         enable_cot: Whether to include Chain of Thought content in the response.
         timeout: Request timeout in seconds (will be converted to milliseconds for Gemini API).
+        max_tokens: Generic output-length cap (as forwarded via LightRAG's
+            provider-agnostic ``llm_model_kwargs``). Mapped to Gemini's native
+            ``max_output_tokens`` unless ``generation_config`` already sets it.
         **_: Additional keyword arguments (ignored).
 
     Returns:
@@ -251,12 +384,33 @@ async def gemini_complete_if_cache(
         RuntimeError: If the response from Gemini is empty.
         ValueError: If API key is not provided or configured.
     """
-    loop = asyncio.get_running_loop()
-
     key = _ensure_api_key(api_key)
     # Convert timeout from seconds to milliseconds for Gemini API
     timeout_ms = timeout * 1000 if timeout else None
     client = _get_gemini_client(key, base_url, timeout_ms)
+
+    # Deprecation shims: map legacy boolean flags to response_format only when
+    # an explicit response_format was not supplied.
+    if response_format is None:
+        if entity_extraction:
+            warnings.warn(
+                "gemini_complete_if_cache(entity_extraction=True) is deprecated; "
+                "pass response_format={'type': 'json_object'} instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            response_format = {"type": "json_object"}
+        elif keyword_extraction:
+            warnings.warn(
+                "gemini_complete_if_cache(keyword_extraction=True) is deprecated; "
+                "pass response_format={'type': 'json_object'} instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            response_format = {"type": "json_object"}
+    _validate_gemini_response_format(response_format)
+    if response_format is not None:
+        enable_cot = False
 
     history_block = _format_history_messages(history_messages)
     prompt_sections = []
@@ -265,39 +419,59 @@ async def gemini_complete_if_cache(
     prompt_sections.append(f"[user] {prompt}")
     combined_prompt = "\n".join(prompt_sections)
 
+    if max_tokens is not None and (
+        generation_config is None or generation_config.get("max_output_tokens") is None
+    ):
+        generation_config = {
+            **(generation_config or {}),
+            "max_output_tokens": max_tokens,
+        }
+
     config_obj = _build_generation_config(
         generation_config,
         system_prompt=system_prompt,
-        keyword_extraction=keyword_extraction,
+        response_format=response_format,
     )
+
+    if image_inputs:
+        from lightrag.llm._vision_utils import normalize_image_inputs
+
+        normalized_images = normalize_image_inputs(image_inputs)
+        parts: list[Any] = [combined_prompt]
+        parts.extend(
+            types.Part.from_bytes(data=img.raw_bytes, mime_type=img.mime_type)
+            for img in normalized_images
+        )
+        contents: list[Any] = [parts]
+    else:
+        contents = [combined_prompt]
 
     request_kwargs: dict[str, Any] = {
         "model": model,
-        "contents": [combined_prompt],
+        "contents": contents,
     }
     if config_obj is not None:
         request_kwargs["config"] = config_obj
 
-    def _call_model():
-        return client.models.generate_content(**request_kwargs)
-
     if stream:
-        queue: asyncio.Queue[Any] = asyncio.Queue()
-        usage_container: dict[str, Any] = {}
 
-        def _stream_model() -> None:
+        async def _async_stream() -> AsyncIterator[str]:
             # COT state tracking for streaming
             cot_active = False
             cot_started = False
             initial_content_seen = False
+            usage_metadata = None
 
             try:
-                stream_kwargs = dict(request_kwargs)
-                stream_iterator = client.models.generate_content_stream(**stream_kwargs)
-                for chunk in stream_iterator:
+                # Use native async streaming from genai SDK
+                # Note: generate_content_stream returns Awaitable[AsyncIterator], need to await first
+                stream_iter = await client.aio.models.generate_content_stream(
+                    **request_kwargs
+                )
+                async for chunk in stream_iter:
                     usage = getattr(chunk, "usage_metadata", None)
                     if usage is not None:
-                        usage_container["usage"] = usage
+                        usage_metadata = usage
 
                     # Extract both regular and thought content
                     regular_text, thought_text = _extract_response_text(
@@ -312,78 +486,74 @@ async def gemini_complete_if_cache(
 
                             # Close COT section if it was active
                             if cot_active:
-                                loop.call_soon_threadsafe(queue.put_nowait, "</think>")
+                                yield "</think>"
                                 cot_active = False
 
-                            # Send regular content
-                            loop.call_soon_threadsafe(queue.put_nowait, regular_text)
+                            # Process and yield regular content
+                            if "\\u" in regular_text:
+                                regular_text = safe_unicode_decode(
+                                    regular_text.encode("utf-8")
+                                )
+                            yield regular_text
 
                         # Process thought content
                         if thought_text:
                             if not initial_content_seen and not cot_started:
                                 # Start COT section
-                                loop.call_soon_threadsafe(queue.put_nowait, "<think>")
+                                yield "<think>"
                                 cot_active = True
                                 cot_started = True
 
-                            # Send thought content if COT is active
+                            # Yield thought content if COT is active
                             if cot_active:
-                                loop.call_soon_threadsafe(
-                                    queue.put_nowait, thought_text
-                                )
+                                if "\\u" in thought_text:
+                                    thought_text = safe_unicode_decode(
+                                        thought_text.encode("utf-8")
+                                    )
+                                yield thought_text
                     else:
-                        # COT disabled - only send regular content
+                        # COT disabled - only yield regular content
                         if regular_text:
-                            loop.call_soon_threadsafe(queue.put_nowait, regular_text)
+                            if "\\u" in regular_text:
+                                regular_text = safe_unicode_decode(
+                                    regular_text.encode("utf-8")
+                                )
+                            yield regular_text
 
                 # Ensure COT is properly closed if still active
                 if cot_active:
-                    loop.call_soon_threadsafe(queue.put_nowait, "</think>")
+                    yield "</think>"
+                    cot_active = False
 
-                loop.call_soon_threadsafe(queue.put_nowait, None)
-            except Exception as exc:  # pragma: no cover - surface runtime issues
-                # Try to close COT tag before reporting error
+            except Exception:
+                # Try to close COT tag before re-raising
                 if cot_active:
                     try:
-                        loop.call_soon_threadsafe(queue.put_nowait, "</think>")
+                        yield "</think>"
                     except Exception:
                         pass
-                loop.call_soon_threadsafe(queue.put_nowait, exc)
-
-        loop.run_in_executor(None, _stream_model)
-
-        async def _async_stream() -> AsyncIterator[str]:
-            try:
-                while True:
-                    item = await queue.get()
-                    if item is None:
-                        break
-                    if isinstance(item, Exception):
-                        raise item
-
-                    chunk_text = str(item)
-                    if "\\u" in chunk_text:
-                        chunk_text = safe_unicode_decode(chunk_text.encode("utf-8"))
-
-                    # Yield the chunk directly without filtering
-                    # COT filtering is already handled in _stream_model()
-                    yield chunk_text
+                raise
             finally:
-                usage = usage_container.get("usage")
-                if token_tracker and usage:
+                # Track token usage after streaming completes
+                if token_tracker and usage_metadata:
                     token_tracker.add_usage(
                         {
-                            "prompt_tokens": getattr(usage, "prompt_token_count", 0),
-                            "completion_tokens": getattr(
-                                usage, "candidates_token_count", 0
+                            "prompt_tokens": getattr(
+                                usage_metadata, "prompt_token_count", 0
                             ),
-                            "total_tokens": getattr(usage, "total_token_count", 0),
+                            "completion_tokens": getattr(
+                                usage_metadata, "candidates_token_count", 0
+                            ),
+                            "total_tokens": getattr(
+                                usage_metadata, "total_token_count", 0
+                            ),
                         }
                     )
 
         return _async_stream()
 
-    response = await asyncio.to_thread(_call_model)
+    # Non-streaming: use native async client
+    response = await client.aio.models.generate_content(**request_kwargs)
 
     # Extract both regular text and thought text
     regular_text, thought_text = _extract_response_text(response, extract_thoughts=True)
@@ -405,14 +575,17 @@ async def gemini_complete_if_cache(
         # Filter out thought content, return only regular content
         final_text = regular_text or ""
 
-    if not final_text:
-        raise InvalidResponseError("Gemini response did not contain any text content.")
+    candidates = getattr(response, "candidates", None)
+    finish_reason = (
+        getattr(candidates[0], "finish_reason", None) if candidates else None
+    )
+    length_limited = finish_reason == types.FinishReason.MAX_TOKENS
 
-    if "\\u" in final_text:
-        final_text = safe_unicode_decode(final_text.encode("utf-8"))
-
-    final_text = remove_think_tags(final_text)
-
+    # Count usage BEFORE the empty-response validation below: the request
+    # consumed its budget whether or not the response is usable — a thinking
+    # model that burned the whole output budget on its reasoning trace is
+    # exactly the case that raises, and omitting it would under-report by a
+    # full-budget generation. The streaming path already tracks in a finally.
     usage = getattr(response, "usage_metadata", None)
     if token_tracker and usage:
         token_tracker.add_usage(
@@ -423,6 +596,79 @@ async def gemini_complete_if_cache(
             }
         )
 
+    def _empty_response_error(thought_len: int) -> Exception:
+        """Diagnose an empty Gemini response the way the OpenAI binding does.
+
+        The exception TYPE selects the retry policy: token-limit exhaustion is
+        deterministic for a given prompt and output budget, so it returns
+        ``EmptyTruncatedResponseError`` — absent from the retry predicate —
+        and fails after ONE request instead of buying two more full-budget
+        generations plus backoff. Every other empty response keeps the
+        retryable ``InvalidResponseError``: those are sampling artifacts a
+        fresh attempt can genuinely fix.
+        """
+        usage_metadata = getattr(response, "usage_metadata", None)
+        diagnostics = format_response_diagnostics(
+            finish_reason=getattr(finish_reason, "name", finish_reason),
+            candidates_token_count=getattr(
+                usage_metadata, "candidates_token_count", None
+            ),
+            thoughts_token_count=getattr(usage_metadata, "thoughts_token_count", None),
+            thought_len=thought_len,
+        )
+        if length_limited:
+            hint = empty_length_truncated_hint(
+                "consider raising GEMINI_LLM_MAX_OUTPUT_TOKENS or disabling "
+                "thinking mode",
+                reasoning_consumed_budget=bool(thought_len),
+            )
+        elif thought_len:
+            hint = (
+                "model returned reasoning-only output (thoughts are stripped "
+                "on this path); consider disabling thinking mode for this role"
+            )
+        else:
+            hint = "model produced no output"
+        message = f"Received empty content from Gemini API ({diagnostics}): {hint}"
+        logger.error(message)
+        if length_limited:
+            return EmptyTruncatedResponseError(message)
+        return InvalidResponseError(message)
+
+    if not final_text:
+        raise _empty_response_error(len((thought_text or "").strip()))
+
+    if "\\u" in final_text:
+        final_text = safe_unicode_decode(final_text.encode("utf-8"))
+
+    final_text = remove_think_tags(final_text)
+
+    # A thinking model that spent its whole budget on the reasoning trace
+    # reaches here with final_text == "<think>...</think>", which the line
+    # above strips to nothing: empty AFTER sanitization is the same broken
+    # response as empty before it, and used to be returned as a successful
+    # (if truncated) empty string. Only escalated for the token-limit case,
+    # which is deterministic and actionable; a reasoning-only response that
+    # ended normally keeps its previous behavior with a warning.
+    if not final_text.strip():
+        if length_limited:
+            raise _empty_response_error(len((thought_text or "").strip()))
+        logger.warning(
+            "Gemini response contained only reasoning content "
+            f"(finish_reason={getattr(finish_reason, 'name', finish_reason)}), "
+            "returning empty content"
+        )
+
+    # Flag token-limit truncation so the cache layer skips persisting partial
+    # output. Must stay the last transformation of final_text: any later
+    # string operation would rebuild a plain str and drop the marker.
+    if length_limited:
+        logger.warning(
+            "Gemini response truncated by token limit "
+            f"(finish_reason=MAX_TOKENS, content_len={len(final_text)}), returning partial content"
+        )
+        final_text = TruncatedResponse(final_text)
+
     logger.debug("Gemini response length: %s", len(final_text))
     return final_text
 
@@ -431,9 +677,13 @@ async def gemini_model_complete(
     prompt: str,
     system_prompt: str | None = None,
     history_messages: list[dict[str, Any]] | None = None,
+    response_format: Any | None = None,
     keyword_extraction: bool = False,
+    entity_extraction: bool = False,
     **kwargs: Any,
 ) -> str | AsyncIterator[str]:
+    # Accept legacy keyword if passed via kwargs to preserve backwards compat.
+    entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
     hashing_kv = kwargs.get("hashing_kv")
     model_name = None
     if hashing_kv is not None:
@@ -448,12 +698,19 @@ async def gemini_model_complete(
         prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
+        response_format=response_format,
         keyword_extraction=keyword_extraction,
+        entity_extraction=entity_extraction,
         **kwargs,
     )
 
 
-@wrap_embedding_func_with_attrs(embedding_dim=1536, max_token_size=2048)
+@wrap_embedding_func_with_attrs(
+    embedding_dim=1536,
+    max_token_size=2048,
+    model_name="gemini-embedding-001",
+    supports_asymmetric=True,
+)
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=60),
@@ -466,6 +723,8 @@ async def gemini_model_complete(
         | retry_if_exception_type(google_api_exceptions.DeadlineExceeded)
         | retry_if_exception_type(google_api_exceptions.Aborted)
         | retry_if_exception_type(google_api_exceptions.Unknown)
+        | retry_if_exception_type(google_genai_errors.ServerError)
+        | retry_if_exception(_is_retryable_gemini_client_error)
     ),
 )
 async def gemini_embed(
@@ -474,9 +733,11 @@ async def gemini_embed(
     base_url: str | None = None,
     api_key: str | None = None,
     embedding_dim: int | None = None,
-    task_type: str = "RETRIEVAL_DOCUMENT",
+    max_token_size: int | None = None,
+    task_type: str | None = None,
     timeout: int | None = None,
     token_tracker: Any | None = None,
+    context: str = "document",
 ) -> np.ndarray:
     """Generate embeddings for a list of texts using Gemini's API.
 
@@ -495,12 +756,20 @@ async def gemini_embed(
             The dimension is controlled by the @wrap_embedding_func_with_attrs decorator
             or the EMBEDDING_DIM environment variable.
             Supported range: 128-3072. Recommended values: 768, 1536, 3072.
+        max_token_size: Maximum tokens per text. This parameter is automatically
+            injected by the EmbeddingFunc wrapper when the underlying function
+            signature supports it (via inspect.signature check). Gemini API will
+            automatically truncate texts exceeding this limit (autoTruncate=True
+            by default), so no client-side truncation is needed.
         task_type: Task type for embedding optimization. Default is "RETRIEVAL_DOCUMENT".
             Supported types: SEMANTIC_SIMILARITY, CLASSIFICATION, CLUSTERING,
             RETRIEVAL_DOCUMENT, RETRIEVAL_QUERY, CODE_RETRIEVAL_QUERY,
             QUESTION_ANSWERING, FACT_VERIFICATION.
         timeout: Request timeout in seconds (will be converted to milliseconds for Gemini API).
         token_tracker: Optional token usage tracker for monitoring API usage.
+        context: The embedding context - "query" for search queries, "document" for indexed content.
+            **IMPORTANT**: This parameter is automatically injected by the EmbeddingFunc wrapper
+            when supports_asymmetric=True. Default is "document".
 
     Returns:
         A numpy array of embeddings, one per input text. For dimensions < 3072,
@@ -514,8 +783,11 @@ async def gemini_embed(
         - For dimension 3072: Embeddings are already normalized by the API
         - For dimensions < 3072: Embeddings are L2-normalized after retrieval
         - Normalization ensures accurate semantic similarity via cosine distance
+        - Gemini API automatically truncates texts exceeding max_token_size (autoTruncate=True)
     """
-    loop = asyncio.get_running_loop()
+    # Note: max_token_size is received but not used for client-side truncation.
+    # Gemini API handles truncation automatically with autoTruncate=True (default).
+    _ = max_token_size  # Acknowledge parameter to avoid unused variable warning
 
     key = _ensure_api_key(api_key)
     # Convert timeout from seconds to milliseconds for Gemini API
@@ -526,8 +798,14 @@ async def gemini_embed(
     config_kwargs: dict[str, Any] = {}
 
     # Add task_type to config
-    if task_type:
-        config_kwargs["task_type"] = task_type
+    if task_type is None:
+        if context == "query":
+            task_type = "RETRIEVAL_QUERY"
+        elif context == "document":
+            task_type = "RETRIEVAL_DOCUMENT"
+        else:
+            task_type = "RETRIEVAL_DOCUMENT"  # Default for backward compatibility
+    config_kwargs["task_type"] = task_type
 
     # Add output_dimensionality if embedding_dim is provided
     if embedding_dim is not None:
@@ -536,19 +814,15 @@ async def gemini_embed(
     # Create config object if we have parameters
     config_obj = types.EmbedContentConfig(**config_kwargs) if config_kwargs else None
 
-    def _call_embed() -> Any:
-        """Call Gemini embedding API in executor thread."""
-        request_kwargs: dict[str, Any] = {
-            "model": model,
-            "contents": texts,
-        }
-        if config_obj is not None:
-            request_kwargs["config"] = config_obj
+    request_kwargs: dict[str, Any] = {
+        "model": model,
+        "contents": texts,
+    }
+    if config_obj is not None:
+        request_kwargs["config"] = config_obj
 
-        return client.models.embed_content(**request_kwargs)
-
-    # Execute API call in thread pool
-    response = await loop.run_in_executor(None, _call_embed)
+    # Use native async client for embedding
+    response = await client.aio.models.embed_content(**request_kwargs)
 
     # Extract embeddings from response
     if not hasattr(response, "embeddings") or not response.embeddings:

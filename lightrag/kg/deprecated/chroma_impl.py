@@ -5,6 +5,7 @@ from typing import Any, final
 import numpy as np
 
 from lightrag.base import BaseVectorStorage
+from lightrag.constants import DEFAULT_QUERY_PRIORITY
 from lightrag.utils import logger
 import pipmaster as pm
 
@@ -21,6 +22,7 @@ class ChromaVectorDBStorage(BaseVectorStorage):
     """ChromaDB vector storage implementation."""
 
     def __post_init__(self):
+        self._validate_embedding_func()
         try:
             config = self.global_config.get("vector_db_storage_cls_kwargs", {})
             cosine_threshold = config.get("cosine_better_than_threshold")
@@ -167,7 +169,7 @@ class ChromaVectorDBStorage(BaseVectorStorage):
     async def query(self, query: str, top_k: int) -> list[dict[str, Any]]:
         try:
             embedding = await self.embedding_func(
-                [query], _priority=5
+                [query], _priority=DEFAULT_QUERY_PRIORITY
             )  # higher priority for query
 
             results = self._collection.query(

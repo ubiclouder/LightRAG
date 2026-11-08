@@ -1,11 +1,11 @@
-import { useState, useCallback, useEffect} from 'react'
+import { useState, useCallback, useEffect, useLayoutEffect, useRef } from 'react'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/Popover'
 import Checkbox from '@/components/ui/Checkbox'
 import Button from '@/components/ui/Button'
 import Separator from '@/components/ui/Separator'
 import Input from '@/components/ui/Input'
 
-import { controlButtonVariant } from '@/lib/constants'
+import { controlButtonVariant, EDGE_PERF_LIMIT } from '@/lib/constants'
 import { useSettingsStore } from '@/stores/settings'
 import { useGraphStore } from '@/stores/graph'
 import useRandomGraph from '@/hooks/useRandomGraph'
@@ -19,18 +19,27 @@ import { useTranslation } from 'react-i18next';
 const LabeledCheckBox = ({
   checked,
   onCheckedChange,
-  label
+  label,
+  disabled,
+  title
 }: {
   checked: boolean
   onCheckedChange: () => void
   label: string
+  disabled?: boolean
+  title?: string
 }) => {
   // Create unique ID using the label text converted to lowercase with spaces removed
   const id = `checkbox-${label.toLowerCase().replace(/\s+/g, '-')}`;
 
+  // The label's peer-disabled:* classes don't fire — Checkbox carries no `peer`
+  // class — so grey the WHOLE row explicitly when disabled, not just the box.
   return (
-    <div className="flex items-center gap-2">
-      <Checkbox id={id} checked={checked} onCheckedChange={onCheckedChange} />
+    <div
+      className={`flex items-center gap-2${disabled ? ' cursor-not-allowed opacity-50' : ''}`}
+      title={title}
+    >
+      <Checkbox id={id} checked={checked} onCheckedChange={onCheckedChange} disabled={disabled} />
       <label
         htmlFor={id}
         className="text-sm leading-none font-medium peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
@@ -64,9 +73,33 @@ const LabeledNumberInput = ({
   // Create unique ID using the label text converted to lowercase with spaces removed
   const id = `input-${label.toLowerCase().replace(/\s+/g, '-')}`;
 
-  useEffect(() => {
+  // Keep refs in sync so the unmount effect can read the latest values
+  const currentValueRef = useRef(currentValue)
+  const valueRef = useRef(value)
+  const onEditFinishedRef = useRef(onEditFinished)
+  useLayoutEffect(() => {
+    currentValueRef.current = currentValue
+    valueRef.current = value
+    onEditFinishedRef.current = onEditFinished
+  })
+
+  // Sync local state when controlled value changes (render-time comparison
+  // avoids cascading renders flagged by react-hooks/set-state-in-effect).
+  const [previousValue, setPreviousValue] = useState(value)
+  if (value !== previousValue) {
+    setPreviousValue(value)
     setCurrentValue(value)
-  }, [value])
+  }
+
+  // Commit any pending change when the component unmounts (e.g. popover closes)
+  useEffect(() => {
+    return () => {
+      const cur = currentValueRef.current
+      if (cur !== null && cur !== valueRef.current) {
+        onEditFinishedRef.current(cur)
+      }
+    }
+  }, [])
 
   const onValueChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -153,6 +186,7 @@ export default function Settings() {
   const showNodeSearchBar = useSettingsStore.use.showNodeSearchBar()
   const showNodeLabel = useSettingsStore.use.showNodeLabel()
   const enableEdgeEvents = useSettingsStore.use.enableEdgeEvents()
+  const graphEdgeCount = useGraphStore.use.graphEdgeCount()
   const enableNodeDrag = useSettingsStore.use.enableNodeDrag()
   const enableHideUnselectedEdges = useSettingsStore.use.enableHideUnselectedEdges()
   const showEdgeLabel = useSettingsStore.use.showEdgeLabel()
@@ -161,7 +195,6 @@ export default function Settings() {
   const graphQueryMaxDepth = useSettingsStore.use.graphQueryMaxDepth()
   const graphMaxNodes = useSettingsStore.use.graphMaxNodes()
   const backendMaxGraphNodes = useSettingsStore.use.backendMaxGraphNodes()
-  const graphLayoutMaxIterations = useSettingsStore.use.graphLayoutMaxIterations()
 
   const enableHealthCheck = useSettingsStore.use.enableHealthCheck()
 
@@ -215,11 +248,7 @@ export default function Settings() {
   const setGraphQueryMaxDepth = useCallback((depth: number) => {
     if (depth < 1) return
     useSettingsStore.setState({ graphQueryMaxDepth: depth })
-    const currentLabel = useSettingsStore.getState().queryLabel
-    useSettingsStore.getState().setQueryLabel('')
-    setTimeout(() => {
-      useSettingsStore.getState().setQueryLabel(currentLabel)
-    }, 300)
+    useGraphStore.getState().setGraphDataFetchAttempted(false)
   }, [])
 
   const setGraphMaxNodes = useCallback((nodes: number) => {
@@ -227,11 +256,6 @@ export default function Settings() {
     if (nodes < 1 || nodes > maxLimit) return
     useSettingsStore.getState().setGraphMaxNodes(nodes, true)
   }, [backendMaxGraphNodes])
-
-  const setGraphLayoutMaxIterations = useCallback((iterations: number) => {
-    if (iterations < 1) return
-    useSettingsStore.setState({ graphLayoutMaxIterations: iterations })
-  }, [])
 
   const handleGenerateRandomGraph = useCallback(() => {
     const graph = randomGraph()
@@ -311,6 +335,12 @@ export default function Settings() {
               checked={enableEdgeEvents}
               onCheckedChange={setEnableEdgeEvents}
               label={t('graphPanel.sideBar.settings.edgeEvents')}
+              disabled={graphEdgeCount > EDGE_PERF_LIMIT}
+              title={
+                graphEdgeCount > EDGE_PERF_LIMIT
+                  ? t('graphPanel.sideBar.settings.edgeEventsDisabledHint', { count: EDGE_PERF_LIMIT })
+                  : undefined
+              }
             />
 
             <div className="flex flex-col gap-2">
@@ -377,14 +407,6 @@ export default function Settings() {
               value={graphMaxNodes}
               defaultValue={backendMaxGraphNodes || 1000}
               onEditFinished={setGraphMaxNodes}
-            />
-            <LabeledNumberInput
-              label={t('graphPanel.sideBar.settings.maxLayoutIterations')}
-              min={1}
-              max={30}
-              value={graphLayoutMaxIterations}
-              defaultValue={15}
-              onEditFinished={setGraphLayoutMaxIterations}
             />
             {/* Development/Testing Section - Only visible in development mode */}
             {import.meta.env.DEV && (

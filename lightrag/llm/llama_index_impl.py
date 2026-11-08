@@ -1,15 +1,22 @@
+import warnings
+
 import pipmaster as pm
+
+# Install required dependencies BEFORE the first llama_index import. A guard
+# placed after it never runs: the import raises ModuleNotFoundError first, so
+# the module is unimportable on exactly the machines the guard exists for.
+# Every sibling provider (ollama, anthropic, bedrock) orders it this way, and
+# tests/llm/test_provider_install_guards.py holds all of them to it.
+if not pm.is_installed("llama-index"):
+    pm.install("llama-index")
+
 from llama_index.core.llms import (
     ChatMessage,
     MessageRole,
     ChatResponse,
 )
-from typing import List, Optional
+from typing import Any, List, Optional
 from lightrag.utils import logger
-
-# Install required dependencies
-if not pm.is_installed("llama-index"):
-    pm.install("llama-index")
 
 from llama_index.core.embeddings import BaseEmbedding
 from llama_index.core.settings import Settings as LlamaIndexSettings
@@ -30,7 +37,7 @@ from lightrag.exceptions import (
 import numpy as np
 
 
-def configure_llama_index(settings: LlamaIndexSettings = None, **kwargs):
+def configure_llama_index(settings: Any = None, **kwargs):
     """
     Configure LlamaIndex settings.
 
@@ -145,26 +152,69 @@ async def llama_index_complete(
     history_messages=None,
     enable_cot: bool = False,
     keyword_extraction=False,
-    settings: LlamaIndexSettings = None,
+    entity_extraction=False,
+    settings: Any = None,
     **kwargs,
 ) -> str:
     """
-    Main completion function for LlamaIndex
+    Main completion function for LlamaIndex.
 
     Args:
         prompt: Input prompt
         system_prompt: Optional system prompt
         history_messages: Optional chat history
-        keyword_extraction: Whether to extract keywords from response
+        keyword_extraction: Deprecated compatibility shim. Emits a warning and
+            is ignored.
+        entity_extraction: Deprecated compatibility shim. Emits a warning and
+            is ignored.
         settings: Optional LlamaIndex settings
-        **kwargs: Additional arguments
+        **kwargs: Additional arguments. ``response_format`` is not supported by
+            this adapter and is stripped before calling LlamaIndex.
+            ``max_tokens`` is folded into ``chat_kwargs`` (without overriding
+            an explicit ``chat_kwargs["max_tokens"]``) since llama_index has
+            no top-level parameter for it.
+
+    Structured output note:
+    - This adapter does not support OpenAI-style ``response_format`` JSON mode.
+    - If callers pass ``response_format``, it is stripped before generation.
     """
     if history_messages is None:
         history_messages = []
 
-    kwargs.pop("keyword_extraction", None)
+    # LlamaIndex adapters have no JSON mode; drop response_format and warn
+    # when legacy boolean shim flags are set.
+    if kwargs.pop("keyword_extraction", False) or keyword_extraction:
+        warnings.warn(
+            "llama_index_complete(keyword_extraction=True) is deprecated; "
+            "pass response_format={'type': 'json_object'} instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    if kwargs.pop("entity_extraction", False) or entity_extraction:
+        warnings.warn(
+            "llama_index_complete(entity_extraction=True) is deprecated; "
+            "pass response_format={'type': 'json_object'} instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    kwargs.pop("response_format", None)
+    # hashing_kv is injected unconditionally by the role LLM wrapper.
+    # Neither it nor streaming is a llama_index_complete_if_cache
+    # parameter, or supported by this adapter -- both are dropped, matching
+    # the explicit-pop pattern in openai.py / ollama.py / anthropic.py.
+    kwargs.pop("hashing_kv", None)
+    kwargs.pop("stream", None)
+    # max_tokens is injected by use_llm_func_with_cache when configured.
+    # llama_index_complete_if_cache has no top-level max_tokens parameter
+    # of its own, but forwards chat_kwargs straight into the underlying
+    # LLM's achat(), so fold it in there instead of discarding it silently.
+    max_tokens = kwargs.pop("max_tokens", None)
+    if max_tokens is not None:
+        chat_kwargs = dict(kwargs.get("chat_kwargs") or {})
+        chat_kwargs.setdefault("max_tokens", max_tokens)
+        kwargs["chat_kwargs"] = chat_kwargs
     result = await llama_index_complete_if_cache(
-        kwargs.get("llm_instance"),
+        kwargs.pop("llm_instance", None),
         prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
@@ -185,7 +235,7 @@ async def llama_index_complete(
 async def llama_index_embed(
     texts: list[str],
     embed_model: BaseEmbedding = None,
-    settings: LlamaIndexSettings = None,
+    settings: Any = None,
     **kwargs,
 ) -> np.ndarray:
     """
@@ -203,6 +253,7 @@ async def llama_index_embed(
     if embed_model is None:
         raise ValueError("embed_model must be provided")
 
-    # Use _get_text_embeddings for batch processing
-    embeddings = embed_model._get_text_embeddings(texts)
+    # Use the async batch method -- the sync _get_text_embeddings would
+    # block the event loop for the whole embedding call.
+    embeddings = await embed_model._aget_text_embeddings(texts)
     return np.array(embeddings)

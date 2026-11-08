@@ -1,7 +1,9 @@
 import os
 import re
 from dataclasses import dataclass
-from typing import final
+from typing import ClassVar
+
+# from typing import final
 import configparser
 
 
@@ -13,10 +15,10 @@ from tenacity import (
 )
 
 import logging
-from ..utils import logger
+from ..utils import logger, validate_workspace
 from ..base import BaseGraphStorage
 from ..types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
-from ..kg.shared_storage import get_data_init_lock, get_graph_db_lock
+from ..kg.shared_storage import get_data_init_lock
 import pipmaster as pm
 
 if not pm.is_installed("neo4j"):
@@ -44,12 +46,51 @@ config.read("config.ini", "utf-8")
 logging.getLogger("neo4j").setLevel(logging.ERROR)
 
 
-@final
+READ_RETRY_EXCEPTIONS = (
+    neo4jExceptions.ServiceUnavailable,
+    neo4jExceptions.TransientError,
+    neo4jExceptions.SessionExpired,
+    ConnectionResetError,
+    OSError,
+    AttributeError,
+)
+
+READ_RETRY = retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type(READ_RETRY_EXCEPTIONS),
+    reraise=True,
+)
+
+
+# Deliberately NOT ``@final``, unlike every other storage class in this package:
+# the decorator was removed by request so this backend can be subclassed. What
+# the tree can show is that nothing in it subclasses this class, so the
+# extension point exists for code outside the repository and cannot be verified
+# from here -- which is a reason to leave it alone, not evidence that restoring
+# it is safe.
+#
+# Before restoring it, note what it would and would not do. ``typing.final`` has
+# no runtime effect: a downstream subclass keeps working, and only a type
+# checker starts rejecting it. So the restore breaks nobody's deployment and
+# silences nobody's tests; it re-asserts the constraint whose removal was asked
+# for, somewhere its author will not see it.
 @dataclass
 class Neo4JStorage(BaseGraphStorage):
+    # Lucene query-syntax reserved characters. The full-text query parser
+    # interprets these (e.g. '-' as NOT) before the analyzer runs, so a raw
+    # 'tb-' becomes a NOT clause and silently matches nothing. Replace them
+    # with spaces so the parser sees plain terms — the index already tokenizes
+    # on these boundaries anyway. Annotated as ClassVar so @dataclass does not
+    # treat it as an instance field.
+    _LUCENE_RESERVED: ClassVar[re.Pattern[str]] = re.compile(
+        r'[+\-&|!(){}\[\]^"~*?:\\/]'
+    )
+
     def __init__(self, namespace, global_config, embedding_func, workspace=None):
         # Read env and override the arg if present
         neo4j_workspace = os.environ.get("NEO4J_WORKSPACE")
+        original_workspace = workspace  # Save original value for logging
         if neo4j_workspace and neo4j_workspace.strip():
             workspace = neo4j_workspace
 
@@ -63,16 +104,81 @@ class Neo4JStorage(BaseGraphStorage):
             global_config=global_config,
             embedding_func=embedding_func,
         )
+        validate_workspace(self.workspace)
+
+        # Log after super().__init__() to ensure self.workspace is initialized
+        if neo4j_workspace and neo4j_workspace.strip():
+            logger.info(
+                f"Using NEO4J_WORKSPACE environment variable: '{neo4j_workspace}' (overriding '{original_workspace}/{namespace}')"
+            )
+
         self._driver = None
 
+    def _get_raw_workspace_label(self) -> str:
+        """Return the actual Neo4j label name for this workspace (no escaping).
+
+        This is the un-escaped label as it is stored on nodes. It is safe to
+        bind as a query parameter (for example, APOC ``labelFilter``), where
+        Neo4j handles the value without string interpolation and therefore
+        without any risk of Cypher injection. It must NOT be interpolated
+        directly into a query string.
+        """
+        workspace = self.workspace.strip()
+        return workspace if workspace else "base"
+
     def _get_workspace_label(self) -> str:
-        """Return workspace label (guaranteed non-empty during initialization)"""
-        return self.workspace
+        """Return sanitized workspace label safe for use as a backtick-quoted identifier in Cypher queries.
+
+        Escapes backticks by doubling them to prevent Cypher injection
+        via the LIGHTRAG-WORKSPACE header, while preserving a 1-to-1 mapping
+        for all other characters. The returned value is intended to be used
+        inside backticks (for example, MATCH (n:`{label}`)) and is not
+        validated as a standalone unquoted identifier.
+
+        For string-literal contexts (such as the APOC ``labelFilter`` config),
+        do NOT interpolate this value; bind ``_get_raw_workspace_label()`` as a
+        query parameter instead.
+        """
+        return self._get_raw_workspace_label().replace("`", "``")
+
+    def _normalize_index_suffix(self, workspace_label: str) -> str:
+        """Normalize workspace label for safe use in index names."""
+        normalized = re.sub(r"[^A-Za-z0-9_]+", "_", workspace_label).strip("_")
+        if not normalized:
+            normalized = "base"
+        if not re.match(r"[A-Za-z_]", normalized[0]):
+            normalized = f"ws_{normalized}"
+        return normalized
+
+    def _get_fulltext_index_name(self, workspace_label: str) -> str:
+        """Return a full-text index name derived from the normalized workspace label."""
+        suffix = self._normalize_index_suffix(workspace_label)
+        return f"entity_id_fulltext_idx_{suffix}"
 
     def _is_chinese_text(self, text: str) -> bool:
-        """Check if text contains Chinese characters."""
-        chinese_pattern = re.compile(r"[\u4e00-\u9fff]+")
-        return bool(chinese_pattern.search(text))
+        """Check if text contains Chinese/CJK characters.
+
+        Covers:
+        - CJK Unified Ideographs (U+4E00-U+9FFF)
+        - CJK Extension A (U+3400-U+4DBF)
+        - CJK Compatibility Ideographs (U+F900-U+FAFF)
+        - CJK Extension B-F (U+20000-U+2FA1F) - supplementary planes
+        """
+        cjk_pattern = re.compile(
+            r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]|[\U00020000-\U0002fa1f]"
+        )
+        return bool(cjk_pattern.search(text))
+
+    @classmethod
+    def _sanitize_fulltext_query(cls, text: str) -> str:
+        """Replace Lucene reserved characters with spaces and collapse whitespace.
+
+        Lets the full-text query parser see plain terms instead of misreading
+        reserved characters as operators (e.g. '-' as NOT). Returns an empty
+        string when the input is composed entirely of reserved characters.
+        """
+        cleaned = cls._LUCENE_RESERVED.sub(" ", text)
+        return " ".join(cleaned.split())
 
     async def initialize(self):
         async with get_data_init_lock():
@@ -230,7 +336,8 @@ class Neo4JStorage(BaseGraphStorage):
         self, driver: AsyncDriver, database: str, workspace_label: str
     ):
         """Create a full-text index on the entity_id property with Chinese tokenizer support."""
-        index_name = "entity_id_fulltext_idx"
+        index_name = self._get_fulltext_index_name(workspace_label)
+        legacy_index_name = "entity_id_fulltext_idx"
         try:
             async with driver.session(database=database) as session:
                 # Check if the full-text index exists and get its configuration
@@ -240,10 +347,33 @@ class Neo4JStorage(BaseGraphStorage):
                 await result.consume()
 
                 existing_index = None
+                legacy_index = None
                 for idx in indexes:
                     if idx["name"] == index_name:
                         existing_index = idx
+                    elif idx["name"] == legacy_index_name:
+                        legacy_index = idx
+                    # Break early if we found both indexes
+                    if existing_index and legacy_index:
                         break
+
+                # Handle legacy index migration
+                if legacy_index and not existing_index:
+                    logger.info(
+                        f"[{self.workspace}] Found legacy index '{legacy_index_name}'. Migrating to '{index_name}'."
+                    )
+                    try:
+                        # Drop the legacy index (use IF EXISTS for safety)
+                        drop_query = f"DROP INDEX {legacy_index_name} IF EXISTS"
+                        result = await session.run(drop_query)
+                        await result.consume()
+                        logger.info(
+                            f"[{self.workspace}] Dropped legacy index '{legacy_index_name}'"
+                        )
+                    except Exception as drop_error:
+                        logger.warning(
+                            f"[{self.workspace}] Failed to drop legacy index: {str(drop_error)}"
+                        )
 
                 # Check if index exists and is online
                 if existing_index:
@@ -274,10 +404,10 @@ class Neo4JStorage(BaseGraphStorage):
                 needs_creation = existing_index is None
 
                 if needs_recreation or needs_creation:
-                    # Drop existing index if it needs recreation
+                    # Drop existing index if it needs recreation (use IF EXISTS for safety)
                     if needs_recreation:
                         try:
-                            drop_query = f"DROP INDEX {index_name}"
+                            drop_query = f"DROP INDEX {index_name} IF EXISTS"
                             result = await session.run(drop_query)
                             await result.consume()
                             logger.info(
@@ -340,10 +470,9 @@ class Neo4JStorage(BaseGraphStorage):
 
     async def finalize(self):
         """Close the Neo4j driver and release all resources"""
-        async with get_graph_db_lock():
-            if self._driver:
-                await self._driver.close()
-                self._driver = None
+        if self._driver:
+            await self._driver.close()
+            self._driver = None
 
     async def __aexit__(self, exc_type, exc, tb):
         """Ensure driver is closed when context manager exits"""
@@ -353,6 +482,7 @@ class Neo4JStorage(BaseGraphStorage):
         # Neo4J handles persistence automatically
         pass
 
+    @READ_RETRY
     async def has_node(self, node_id: str) -> bool:
         """
         Check if a node with the given label exists in the database
@@ -386,6 +516,7 @@ class Neo4JStorage(BaseGraphStorage):
                     await result.consume()  # Ensure results are consumed even on error
                 raise
 
+    @READ_RETRY
     async def has_edge(self, source_node_id: str, target_node_id: str) -> bool:
         """
         Check if an edge exists between two nodes
@@ -427,6 +558,7 @@ class Neo4JStorage(BaseGraphStorage):
                     await result.consume()  # Ensure results are consumed even on error
                 raise
 
+    @READ_RETRY
     async def get_node(self, node_id: str) -> dict[str, str] | None:
         """Get node by its label identifier, return only node properties
 
@@ -480,6 +612,7 @@ class Neo4JStorage(BaseGraphStorage):
                 )
                 raise
 
+    @READ_RETRY
     async def get_nodes_batch(self, node_ids: list[str]) -> dict[str, dict]:
         """
         Retrieve multiple nodes in one query using UNWIND.
@@ -516,6 +649,7 @@ class Neo4JStorage(BaseGraphStorage):
             await result.consume()  # Make sure to consume the result fully
             return nodes
 
+    @READ_RETRY
     async def node_degree(self, node_id: str) -> int:
         """Get the degree (number of relationships) of a node with the given label.
         If multiple nodes have the same label, returns the degree of the first node.
@@ -564,6 +698,7 @@ class Neo4JStorage(BaseGraphStorage):
                 )
                 raise
 
+    @READ_RETRY
     async def node_degrees_batch(self, node_ids: list[str]) -> dict[str, int]:
         """
         Retrieve the degree for multiple nodes in a single query using UNWIND.
@@ -622,6 +757,7 @@ class Neo4JStorage(BaseGraphStorage):
         degrees = int(src_degree) + int(trg_degree)
         return degrees
 
+    @READ_RETRY
     async def edge_degrees_batch(
         self, edge_pairs: list[tuple[str, str]]
     ) -> dict[tuple[str, str], int]:
@@ -648,6 +784,7 @@ class Neo4JStorage(BaseGraphStorage):
             edge_degrees[(src, tgt)] = degrees.get(src, 0) + degrees.get(tgt, 0)
         return edge_degrees
 
+    @READ_RETRY
     async def get_edge(
         self, source_node_id: str, target_node_id: str
     ) -> dict[str, str] | None:
@@ -735,6 +872,7 @@ class Neo4JStorage(BaseGraphStorage):
             )
             raise
 
+    @READ_RETRY
     async def get_edges_batch(
         self, pairs: list[dict[str, str]]
     ) -> dict[tuple[str, str], dict]:
@@ -745,8 +883,12 @@ class Neo4JStorage(BaseGraphStorage):
             pairs: List of dictionaries, e.g. [{"src": "node1", "tgt": "node2"}, ...]
 
         Returns:
-            A dictionary mapping (src, tgt) tuples to their edge properties.
+            A dictionary mapping existing (src, tgt) tuples to their edge
+            properties. Missing pairs are omitted.
         """
+        if not pairs:
+            return {}
+
         workspace_label = self._get_workspace_label()
         async with self._driver.session(
             database=self._DATABASE, default_access_mode="READ"
@@ -762,29 +904,23 @@ class Neo4JStorage(BaseGraphStorage):
                 src = record["src_id"]
                 tgt = record["tgt_id"]
                 edges = record["edges"]
-                if edges and len(edges) > 0:
-                    edge_props = edges[0]  # choose the first if multiple exist
-                    # Ensure required keys exist with defaults
-                    for key, default in {
-                        "weight": 1.0,
-                        "source_id": None,
-                        "description": None,
-                        "keywords": None,
-                    }.items():
-                        if key not in edge_props:
-                            edge_props[key] = default
-                    edges_dict[(src, tgt)] = edge_props
-                else:
-                    # No edge found – set default edge properties
-                    edges_dict[(src, tgt)] = {
-                        "weight": 1.0,
-                        "source_id": None,
-                        "description": None,
-                        "keywords": None,
-                    }
+                # MATCH only emits records for existing relationships, so the
+                # aggregate always contains at least one relationship.
+                edge_props = dict(edges[0])  # choose the first if multiple exist
+                # Ensure required keys exist with defaults
+                for key, default in {
+                    "weight": 1.0,
+                    "source_id": None,
+                    "description": None,
+                    "keywords": None,
+                }.items():
+                    if key not in edge_props:
+                        edge_props[key] = default
+                edges_dict[(src, tgt)] = edge_props
             await result.consume()
             return edges_dict
 
+    @READ_RETRY
     async def get_node_edges(self, source_node_id: str) -> list[tuple[str, str]] | None:
         """Retrieves all edges (relationships) for a particular node identified by its label.
 
@@ -793,7 +929,9 @@ class Neo4JStorage(BaseGraphStorage):
 
         Returns:
             list[tuple[str, str]]: List of (source_label, target_label) tuples representing edges
-            None: If no edges found
+            None: If the node does not exist. An existing node with no relations
+                returns ``[]`` — the BaseGraphStorage contract, as implemented by
+                NetworkXStorage. A query error is neither value: it propagates.
 
         Raises:
             ValueError: If source_node_id is invalid
@@ -813,7 +951,14 @@ class Neo4JStorage(BaseGraphStorage):
                     results = await session.run(query, entity_id=source_node_id)
 
                     edges = []
+                    # Any row at all means the anchor MATCH bound n, i.e. the
+                    # node exists: an isolated node still yields exactly one row
+                    # (via OPTIONAL MATCH) carrying a NULL connected node. Zero
+                    # rows is the only "no such node" signal, and it must not be
+                    # reported as an empty edge list.
+                    node_matched = False
                     async for record in results:
+                        node_matched = True
                         source_node = record["n"]
                         connected_node = record["connected"]
 
@@ -836,7 +981,7 @@ class Neo4JStorage(BaseGraphStorage):
                             edges.append((source_label, target_label))
 
                     await results.consume()  # Ensure results are consumed
-                    return edges
+                    return edges if node_matched else None
                 except Exception as e:
                     logger.error(
                         f"[{self.workspace}] Error getting edges for node {source_node_id}: {str(e)}"
@@ -852,6 +997,7 @@ class Neo4JStorage(BaseGraphStorage):
             )
             raise
 
+    @READ_RETRY
     async def get_nodes_edges_batch(
         self, node_ids: list[str]
     ) -> dict[str, list[tuple[str, str]]]:
@@ -936,7 +1082,6 @@ class Neo4JStorage(BaseGraphStorage):
         """
         workspace_label = self._get_workspace_label()
         properties = node_data
-        entity_type = properties["entity_type"]
         if "entity_id" not in properties:
             raise ValueError("Neo4j: node properties must contain an 'entity_id' field")
 
@@ -947,7 +1092,6 @@ class Neo4JStorage(BaseGraphStorage):
                     query = f"""
                     MERGE (n:`{workspace_label}` {{entity_id: $entity_id}})
                     SET n += $properties
-                    SET n:`{entity_type}`
                     """
                     result = await tx.run(
                         query, entity_id=node_id, properties=properties
@@ -957,6 +1101,140 @@ class Neo4JStorage(BaseGraphStorage):
                 await session.execute_write(execute_upsert)
         except Exception as e:
             logger.error(f"[{self.workspace}] Error during upsert: {str(e)}")
+            raise
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type(
+            (
+                neo4jExceptions.ServiceUnavailable,
+                neo4jExceptions.TransientError,
+                neo4jExceptions.WriteServiceUnavailable,
+                neo4jExceptions.ClientError,
+                neo4jExceptions.SessionExpired,
+                ConnectionResetError,
+                OSError,
+            )
+        ),
+    )
+    async def upsert_nodes_batch(self, nodes: list[tuple[str, dict[str, str]]]) -> None:
+        """Batch insert/update multiple nodes using a single UNWIND Cypher query.
+
+        Significantly faster than calling upsert_node() in a loop for large imports
+        because it executes all merges in one round-trip to the database.
+
+        Args:
+            nodes: List of (node_id, node_data) tuples.
+        """
+        if not nodes:
+            return
+        workspace_label = self._get_workspace_label()
+        nodes_data = []
+        for node_id, node_data in nodes:
+            if "entity_id" not in node_data:
+                raise ValueError(
+                    "Neo4j: node properties must contain an 'entity_id' field"
+                )
+            nodes_data.append({"entity_id": node_id, "props": node_data})
+
+        try:
+            async with self._driver.session(database=self._DATABASE) as session:
+
+                async def execute_batch(tx: AsyncManagedTransaction):
+                    query = f"""
+                    UNWIND $nodes AS row
+                    MERGE (n:`{workspace_label}` {{entity_id: row.entity_id}})
+                    SET n += row.props
+                    """
+                    result = await tx.run(query, nodes=nodes_data)
+                    await result.consume()
+
+                await session.execute_write(execute_batch)
+        except Exception as e:
+            logger.error(f"[{self.workspace}] Error during batch node upsert: {str(e)}")
+            raise
+
+    @READ_RETRY
+    async def has_nodes_batch(self, node_ids: list[str]) -> set[str]:
+        """Check existence of multiple nodes in a single UNWIND query.
+
+        Args:
+            node_ids: List of node IDs to check.
+
+        Returns:
+            Set of node_ids that exist in the graph.
+        """
+        if not node_ids:
+            return set()
+        workspace_label = self._get_workspace_label()
+        try:
+            async with self._driver.session(
+                database=self._DATABASE, default_access_mode="READ"
+            ) as session:
+                query = f"""
+                UNWIND $ids AS id
+                MATCH (n:`{workspace_label}` {{entity_id: id}})
+                RETURN n.entity_id AS entity_id
+                """
+                result = await session.run(query, ids=node_ids)
+                records = await result.data()
+                await result.consume()
+                return {r["entity_id"] for r in records}
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Error during batch node existence check: {str(e)}"
+            )
+            raise
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type(
+            (
+                neo4jExceptions.ServiceUnavailable,
+                neo4jExceptions.TransientError,
+                neo4jExceptions.WriteServiceUnavailable,
+                neo4jExceptions.ClientError,
+                neo4jExceptions.SessionExpired,
+                ConnectionResetError,
+                OSError,
+            )
+        ),
+    )
+    async def upsert_edges_batch(
+        self, edges: list[tuple[str, str, dict[str, str]]]
+    ) -> None:
+        """Batch insert/update multiple edges using a single UNWIND Cypher query.
+
+        Args:
+            edges: List of (source_node_id, target_node_id, edge_data) tuples.
+        """
+        if not edges:
+            return
+        workspace_label = self._get_workspace_label()
+        edges_data = [
+            {"src": src, "tgt": tgt, "props": edge_data}
+            for src, tgt, edge_data in edges
+        ]
+        try:
+            async with self._driver.session(database=self._DATABASE) as session:
+
+                async def execute_batch(tx: AsyncManagedTransaction):
+                    query = f"""
+                    UNWIND $edges AS row
+                    MATCH (source:`{workspace_label}` {{entity_id: row.src}})
+                    WITH source, row
+                    MATCH (target:`{workspace_label}` {{entity_id: row.tgt}})
+                    MERGE (source)-[r:DIRECTED]-(target)
+                    SET r += row.props
+                    """
+                    result = await tx.run(query, edges=edges_data)
+                    await result.consume()
+
+                await session.execute_write(execute_batch)
+        except Exception as e:
+            logger.error(f"[{self.workspace}] Error during batch edge upsert: {str(e)}")
             raise
 
     @retry(
@@ -1046,6 +1324,9 @@ class Neo4JStorage(BaseGraphStorage):
             max_nodes = min(max_nodes, self.global_config.get("max_graph_nodes", 1000))
 
         workspace_label = self._get_workspace_label()
+        # Raw (un-escaped) label bound as a query parameter for APOC labelFilter,
+        # which lives inside a Cypher string literal and must not be interpolated.
+        workspace_label_raw = self._get_raw_workspace_label()
         result = KnowledgeGraph()
         seen_nodes = set()
         seen_edges = set()
@@ -1073,12 +1354,16 @@ class Neo4JStorage(BaseGraphStorage):
                         if count_result:
                             await count_result.consume()
 
-                    # Run main query to get nodes with highest degree
+                    # Run main query to get nodes with highest degree.
+                    # Degree descending, then entity_id ascending: the tie-break
+                    # is the BaseGraphStorage contract, and without it the
+                    # LIMIT cut an unordered band of equal-degree entities, so
+                    # the same graph returned different nodes run to run.
                     main_query = f"""
                     MATCH (n:`{workspace_label}`)
                     OPTIONAL MATCH (n)-[r]-()
                     WITH n, COALESCE(count(r), 0) AS degree
-                    ORDER BY degree DESC
+                    ORDER BY degree DESC, n.entity_id ASC
                     LIMIT $max_nodes
                     WITH collect({{node: n}}) AS filtered_nodes
                     UNWIND filtered_nodes AS node_info
@@ -1108,7 +1393,7 @@ class Neo4JStorage(BaseGraphStorage):
                     WITH start
                     CALL apoc.path.subgraphAll(start, {{
                         relationshipFilter: '',
-                        labelFilter: '{workspace_label}',
+                        labelFilter: $label_filter,
                         minLevel: 0,
                         maxLevel: $max_depth,
                         bfs: true
@@ -1128,6 +1413,7 @@ class Neo4JStorage(BaseGraphStorage):
                             {
                                 "entity_id": node_label,
                                 "max_depth": max_depth,
+                                "label_filter": workspace_label_raw,
                             },
                         )
                         full_record = await full_result.single()
@@ -1162,7 +1448,7 @@ class Neo4JStorage(BaseGraphStorage):
                             WITH start
                             CALL apoc.path.subgraphAll(start, {{
                                 relationshipFilter: '',
-                                labelFilter: '{workspace_label}',
+                                labelFilter: $label_filter,
                                 minLevel: 0,
                                 maxLevel: $max_depth,
                                 limit: $max_nodes,
@@ -1181,6 +1467,7 @@ class Neo4JStorage(BaseGraphStorage):
                                         "entity_id": node_label,
                                         "max_depth": max_depth,
                                         "max_nodes": max_nodes,
+                                        "label_filter": workspace_label_raw,
                                     },
                                 )
                                 record = await result_set.single()
@@ -1285,7 +1572,7 @@ class Neo4JStorage(BaseGraphStorage):
         queue = deque([(start_node, None, 0)])
 
         # True BFS implementation using a queue
-        while queue and len(visited_nodes) < max_nodes:
+        while queue:
             # Dequeue the next node to process
             current_node, current_edge, current_depth = queue.popleft()
 
@@ -1299,6 +1586,19 @@ class Neo4JStorage(BaseGraphStorage):
                 )
                 continue
 
+            # This is a real, not-yet-visited, in-depth-limit node that cannot
+            # be added because the cap is already full -- that's the only
+            # condition that proves truncation. Checking the cap here (rather
+            # than after appending, or via the while-loop condition) means a
+            # queue that runs dry exactly at max_nodes never reaches this
+            # check and is never falsely reported as truncated.
+            if len(visited_nodes) >= max_nodes:
+                result.is_truncated = True
+                logger.info(
+                    f"[{self.workspace}] Graph truncated: breadth-first search limited to: {max_nodes} nodes"
+                )
+                break
+
             # Add current node to result
             result.nodes.append(current_node)
             visited_nodes.add(current_node.id)
@@ -1307,14 +1607,6 @@ class Neo4JStorage(BaseGraphStorage):
             if current_edge and current_edge.id not in visited_edges:
                 result.edges.append(current_edge)
                 visited_edges.add(current_edge.id)
-
-            # Stop if we've reached the node limit
-            if len(visited_nodes) >= max_nodes:
-                result.is_truncated = True
-                logger.info(
-                    f"[{self.workspace}] Graph truncated: breadth-first search limited to: {max_nodes} nodes"
-                )
-                break
 
             # Get all edges and target nodes for the current node (even at max_depth)
             async with self._driver.session(
@@ -1402,7 +1694,7 @@ class Neo4JStorage(BaseGraphStorage):
 
     async def get_all_labels(self) -> list[str]:
         """
-        Get all existing node labels in the database
+        Get all existing entity_ids(entity names) in the database
         Returns:
             ["Person", "Company", ...]  # Alphabetically sorted label list
         """
@@ -1430,6 +1722,33 @@ class Neo4JStorage(BaseGraphStorage):
                     result.consume()
                 )  # Ensure results are consumed even if processing fails
             return labels
+
+    async def iter_labels(self, batch_size: int):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        workspace_label = self._get_workspace_label()
+        async with self._driver.session(
+            database=self._DATABASE, default_access_mode="READ"
+        ) as session:
+            result = await session.run(
+                f"""
+                MATCH (n:`{workspace_label}`)
+                WHERE n.entity_id IS NOT NULL
+                RETURN DISTINCT n.entity_id AS label
+                ORDER BY label
+                """
+            )
+            batch: list[str] = []
+            try:
+                async for record in result:
+                    batch.append(record["label"])
+                    if len(batch) == batch_size:
+                        yield batch
+                        batch = []
+                if batch:
+                    yield batch
+            finally:
+                await result.consume()
 
     @retry(
         stop=stop_after_attempt(3),
@@ -1573,9 +1892,18 @@ class Neo4JStorage(BaseGraphStorage):
         async with self._driver.session(
             database=self._DATABASE, default_access_mode="READ"
         ) as session:
+            # `-[r]-` is undirected with both endpoints free, so the pattern
+            # matcher yields one row per orientation of every relationship --
+            # {a:X, b:Y} and {a:Y, b:X}. Every edge is created through an
+            # undirected MERGE (see upsert_edge), which still gives the
+            # relationship exactly one physical direction in storage, so a
+            # DIRECTED match (`-[r]->`) returns it exactly once with no
+            # DISTINCT and no client-side dedup set -- unlike id(r)-based
+            # dedup, this stays O(1) client memory regardless of graph size,
+            # which iter_edges' batch/yield contract requires.
             query = f"""
-            MATCH (a:`{workspace_label}`)-[r]-(b:`{workspace_label}`)
-            RETURN DISTINCT a.entity_id AS source, b.entity_id AS target, properties(r) AS properties
+            MATCH (a:`{workspace_label}`)-[r]->(b:`{workspace_label}`)
+            RETURN a.entity_id AS source, b.entity_id AS target, properties(r) AS properties
             """
             result = await session.run(query)
             edges = []
@@ -1587,14 +1915,47 @@ class Neo4JStorage(BaseGraphStorage):
             await result.consume()
             return edges
 
+    async def iter_edges(self, batch_size: int):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        workspace_label = self._get_workspace_label()
+        async with self._driver.session(
+            database=self._DATABASE, default_access_mode="READ"
+        ) as session:
+            # Same undirected-double-count trap as get_all_edges, same fix:
+            # a DIRECTED match returns each relationship exactly once with
+            # no client-side dedup set, keeping this generator's memory use
+            # bounded by batch_size regardless of graph size.
+            result = await session.run(
+                f"""
+                MATCH (a:`{workspace_label}`)-[r]->(b:`{workspace_label}`)
+                RETURN a.entity_id AS source, b.entity_id AS target,
+                       properties(r) AS properties
+                """
+            )
+            batch: list[dict] = []
+            try:
+                async for record in result:
+                    edge = dict(record["properties"])
+                    edge["source"] = record["source"]
+                    edge["target"] = record["target"]
+                    batch.append(edge)
+                    if len(batch) == batch_size:
+                        yield batch
+                        batch = []
+                if batch:
+                    yield batch
+            finally:
+                await result.consume()
+
     async def get_popular_labels(self, limit: int = 300) -> list[str]:
-        """Get popular labels by node degree (most connected entities)
+        """Get popular labels(entity names) by node degree (most connected entities)
 
         Args:
             limit: Maximum number of labels to return
 
         Returns:
-            List of labels sorted by degree (highest first)
+            List of labels(entity names) sorted by degree (highest first)
         """
         workspace_label = self._get_workspace_label()
         async with self._driver.session(
@@ -1631,7 +1992,7 @@ class Neo4JStorage(BaseGraphStorage):
 
     async def search_labels(self, query: str, limit: int = 50) -> list[str]:
         """
-        Search labels with fuzzy matching, using a full-text index for performance if available.
+        Search labels(entity names) with fuzzy matching, using a full-text index for performance if available.
         Enhanced with Chinese text support using CJK analyzer.
         Falls back to a slower CONTAINS search if the index is not available or fails.
         """
@@ -1642,7 +2003,16 @@ class Neo4JStorage(BaseGraphStorage):
 
         query_lower = query_strip.lower()
         is_chinese = self._is_chinese_text(query_strip)
-        index_name = "entity_id_fulltext_idx"
+        index_name = self._get_fulltext_index_name(workspace_label)
+
+        # Strip Lucene reserved characters before handing the text to the
+        # full-text query parser (see _sanitize_fulltext_query). The CASE-based
+        # scoring below still uses the raw query_strip / query_lower.
+        sanitized_query = self._sanitize_fulltext_query(query_strip)
+        if not sanitized_query:
+            # Query was composed entirely of reserved characters (e.g. "---").
+            # Return empty rather than falling back to a full-graph CONTAINS scan.
+            return []
 
         # Attempt to use the full-text index first
         try:
@@ -1667,7 +2037,7 @@ class Neo4JStorage(BaseGraphStorage):
                     LIMIT $limit
                     """
                     # For Chinese, don't add wildcard as it may not work properly with CJK analyzer
-                    search_query = query_strip
+                    search_query = sanitized_query
                 else:
                     # For non-Chinese text, use the original logic with wildcard
                     cypher_query = f"""
@@ -1686,7 +2056,7 @@ class Neo4JStorage(BaseGraphStorage):
                     ORDER BY final_score DESC, label ASC
                     LIMIT $limit
                     """
-                    search_query = f"{query_strip}*"
+                    search_query = f"{sanitized_query}*"
 
                 result = await session.run(
                     cypher_query,
@@ -1773,24 +2143,23 @@ class Neo4JStorage(BaseGraphStorage):
             - On success: {"status": "success", "message": "workspace data dropped"}
             - On failure: {"status": "error", "message": "<error details>"}
         """
-        async with get_graph_db_lock():
-            workspace_label = self._get_workspace_label()
-            try:
-                async with self._driver.session(database=self._DATABASE) as session:
-                    # Delete all nodes and relationships in current workspace only
-                    query = f"MATCH (n:`{workspace_label}`) DETACH DELETE n"
-                    result = await session.run(query)
-                    await result.consume()  # Ensure result is fully consumed
+        workspace_label = self._get_workspace_label()
+        try:
+            async with self._driver.session(database=self._DATABASE) as session:
+                # Delete all nodes and relationships in current workspace only
+                query = f"MATCH (n:`{workspace_label}`) DETACH DELETE n"
+                result = await session.run(query)
+                await result.consume()  # Ensure result is fully consumed
 
-                    # logger.debug(
-                    #     f"[{self.workspace}] Process {os.getpid()} drop Neo4j workspace '{workspace_label}' in database {self._DATABASE}"
-                    # )
-                    return {
-                        "status": "success",
-                        "message": f"workspace '{workspace_label}' data dropped",
-                    }
-            except Exception as e:
-                logger.error(
-                    f"[{self.workspace}] Error dropping Neo4j workspace '{workspace_label}' in database {self._DATABASE}: {e}"
-                )
-                return {"status": "error", "message": str(e)}
+                # logger.debug(
+                #     f"[{self.workspace}] Process {os.getpid()} drop Neo4j workspace '{workspace_label}' in database {self._DATABASE}"
+                # )
+                return {
+                    "status": "success",
+                    "message": f"workspace '{workspace_label}' data dropped",
+                }
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Error dropping Neo4j workspace '{workspace_label}' in database {self._DATABASE}: {e}"
+            )
+            return {"status": "error", "message": str(e)}

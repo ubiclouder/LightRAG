@@ -1,8 +1,20 @@
 import axios, { AxiosError } from 'axios'
-import { backendBaseUrl, popularLabelsDefaultLimit, searchLabelsDefaultLimit } from '@/lib/constants'
+import {
+  backendBaseUrl,
+  documentFetchTimeoutMessage,
+  healthCheckTimeout,
+  pipelineStatusTimeout,
+  popularLabelsDefaultLimit,
+  searchLabelsDefaultLimit
+} from '@/lib/constants'
+import type { SupportedFileTypes } from '@/lib/fileTypes'
 import { errorMessage } from '@/lib/utils'
+import { decodeBase64Url } from '@/lib/base64url'
 import { useSettingsStore } from '@/stores/settings'
+import { useAuthStore } from '@/stores/state'
+import { applyAiContentNoticeFlag } from '@/stores/aiContentNotice'
 import { navigationService } from '@/services/navigation'
+import { AuthenticationRequiredError, isAuthenticationRequiredError } from '@/api/errors'
 
 // Types
 export type LightragNodeType = {
@@ -24,6 +36,33 @@ export type LightragGraphType = {
   edges: LightragEdgeType[]
 }
 
+export type LightragQueueStatus = {
+  available: boolean
+  queue_name?: string
+  max_async?: number
+  max_queue_size?: number
+  queued?: number
+  running?: number
+  in_flight?: number
+  worker_count?: number
+  initialized?: boolean
+  submitted_total?: number
+  completed_total?: number
+  failed_total?: number
+  cancelled_total?: number
+  rejected_total?: number
+}
+
+export type LightragRoleLLMConfig = {
+  binding?: string | null
+  model?: string | null
+  host?: string | null
+  max_async?: number
+  timeout?: number
+  has_model_kwargs?: boolean
+  metadata?: Record<string, any>
+}
+
 export type LightragStatus = {
   status: 'healthy'
   working_directory: string
@@ -40,26 +79,76 @@ export type LightragStatus = {
     graph_storage: string
     vector_storage: string
     workspace?: string
+    storage_workspaces?: {
+      kv_storage?: string | null
+      doc_status_storage?: string | null
+      graph_storage?: string | null
+      vector_storage?: string | null
+    }
     max_graph_nodes?: string
     enable_rerank?: boolean
     rerank_binding?: string | null
     rerank_model?: string | null
     rerank_binding_host?: string | null
+    rerank_max_async?: number
+    rerank_timeout?: number
     summary_language: string
     force_llm_summary_on_merge: boolean
     max_parallel_insert: number
     max_async: number
+    llm_timeout?: number
     embedding_func_max_async: number
     embedding_batch_num: number
+    embedding_timeout?: number
     cosine_threshold: number
     min_rerank_score: number
     related_chunk_number: number
+    role_llm_config?: Record<string, LightragRoleLLMConfig>
+    vlm_process_enable?: boolean
+    parser_routing?: string
+    mineru?: {
+      endpoint: string
+      api_mode: 'official' | 'local' | null
+      options: {
+        language?: string
+        enable_table?: boolean
+        enable_formula?: boolean
+        model_version?: string
+        is_ocr?: boolean
+        local_backend?: string
+        local_parse_method?: string
+        local_image_analysis?: boolean
+      }
+    }
+    docling?: {
+      endpoint: string
+      options: {
+        do_ocr?: boolean
+        force_ocr?: boolean
+        ocr_engine?: string
+        ocr_lang?: string
+        do_formula_enrichment?: boolean
+      }
+    }
   }
   update_status?: Record<string, any>
   core_version?: string
   api_version?: string
+  webui_available?: boolean
+  /** Whether /docs, /redoc and /openapi.json are served. Absent on older
+   * backends, which always expose them (see apiDocsCapability in state.ts). */
+  api_docs_available?: boolean
   auth_mode?: 'enabled' | 'disabled'
+  server_mode?: 'uvicorn' | 'gunicorn'
+  workers?: number
   pipeline_busy: boolean
+  pipeline_active?: boolean
+  pipeline_scanning?: boolean
+  pipeline_destructive_busy?: boolean
+  pipeline_pending_enqueues?: number
+  llm_queue_status?: Record<string, LightragQueueStatus>
+  embedding_queue_status?: LightragQueueStatus
+  rerank_queue_status?: LightragQueueStatus
   keyed_locks?: {
     process_id: number
     cleanup_performed: {
@@ -75,14 +164,8 @@ export type LightragStatus = {
   }
   webui_title?: string
   webui_description?: string
-}
-
-export type LightragDocumentsScanProgress = {
-  is_scanning: boolean
-  current_file: string
-  indexed_count: number
-  total_files: number
-  progress: number
+  /** Whether answers are labelled as AI-generated in the query UIs. */
+  ai_content_notice_enabled?: boolean
 }
 
 /**
@@ -102,6 +185,8 @@ export type Message = {
   thinkingContent?: string
   displayContent?: string
   thinkingTime?: number | null
+  responseTime?: number | null
+  firstTokenTime?: number | null
 }
 
 export type QueryRequest = {
@@ -133,14 +218,35 @@ export type QueryRequest = {
   conversation_history?: Message[]
   /** Number of complete conversation turns (user-assistant pairs) to consider in the response context. */
   history_turns?: number
-  /** User-provided prompt for the query. If provided, this will be used instead of the default value from prompt template. */
+  /**
+   * Additional instructions for the LLM, injected into the "Additional
+   * Instructions" section of the answer prompt. Does not affect retrieval.
+   * The server may prepend a global prefix; see disable_user_prompt_prefix.
+   */
   user_prompt?: string
+  /**
+   * If true, the server-side global prompt prefix is not prepended to
+   * user_prompt, leaving this client in full control of the final instruction
+   * text. The prefix itself is server configuration and cannot be read or
+   * replaced from here. Default: false.
+   */
+  disable_user_prompt_prefix?: boolean
   /** Enable reranking for retrieved text chunks. If True but no rerank model is configured, a warning will be issued. Default is True. */
   enable_rerank?: boolean
+  /** If True, emits retrieval progress events and a final response-time metadata line (streaming only). Default: false. */
+  include_progress?: boolean
 }
 
 export type QueryResponse = {
   response: string
+  response_time?: number
+  /**
+   * Whether the answering LLM actually wrote this response. False for text a
+   * query path produced without calling it — the canned no-context reply and
+   * the only_need_context / only_need_prompt debug output. Absent on servers
+   * older than the field.
+   */
+  llm_generated?: boolean
 }
 
 export type EntityUpdateResponse = {
@@ -159,13 +265,13 @@ export type EntityUpdateResponse = {
 }
 
 export type DocActionResponse = {
-  status: 'success' | 'partial_success' | 'failure' | 'duplicated'
+  status: 'success' | 'partial_success' | 'failure'
   message: string
   track_id?: string
 }
 
 export type ScanResponse = {
-  status: 'scanning_started'
+  status: 'scanning_started' | 'scanning_skipped_pipeline_busy'
   message: string
   track_id: string
 }
@@ -182,7 +288,14 @@ export type DeleteDocResponse = {
   doc_id: string
 }
 
-export type DocStatus = 'pending' | 'processing' | 'preprocessed' | 'processed' | 'failed'
+export type DocStatus =
+  | 'pending'
+  | 'parsing'
+  | 'analyzing'
+  | 'processing'
+  | 'preprocessed'
+  | 'processed'
+  | 'failed'
 
 export type DocStatusResponse = {
   id: string
@@ -198,10 +311,6 @@ export type DocStatusResponse = {
   file_path: string
 }
 
-export type DocsStatusesResponse = {
-  statuses: Record<DocStatus, DocStatusResponse[]>
-}
-
 export type TrackStatusResponse = {
   track_id: string
   documents: DocStatusResponse[]
@@ -211,6 +320,7 @@ export type TrackStatusResponse = {
 
 export type DocumentsRequest = {
   status_filter?: DocStatus | null
+  status_filters?: DocStatus[] | null
   page: number
   page_size: number
   sort_field: 'created_at' | 'updated_at' | 'id' | 'file_path'
@@ -232,10 +342,6 @@ export type PaginatedDocsResponse = {
   status_counts: Record<string, number>
 }
 
-export type StatusCountsResponse = {
-  status_counts: Record<string, number>
-}
-
 export type AuthStatusResponse = {
   auth_configured: boolean
   access_token?: string
@@ -246,17 +352,17 @@ export type AuthStatusResponse = {
   api_version?: string
   webui_title?: string
   webui_description?: string
+  /** Whether answers are labelled as AI-generated in the query UIs. */
+  ai_content_notice_enabled?: boolean
 }
 
 export type PipelineStatusResponse = {
-  autoscanned: boolean
   busy: boolean
   job_name: string
   job_start?: string
   docs: number
   batchs: number
   cur_batch: number
-  request_pending: boolean
   cancellation_requested?: boolean
   latest_message: string
   history_messages?: string[]
@@ -272,6 +378,8 @@ export type LoginResponse = {
   api_version?: string
   webui_title?: string
   webui_description?: string
+  /** Whether answers are labelled as AI-generated in the query UIs. */
+  ai_content_notice_enabled?: boolean
 }
 
 export const InvalidApiKeyError = 'Invalid API Key'
@@ -285,8 +393,64 @@ const axiosInstance = axios.create({
   }
 })
 
+// ========== Token Management ==========
+// Prevent multiple requests from triggering token refresh simultaneously
+let isRefreshingGuestToken = false;
+let refreshTokenPromise: Promise<string> | null = null;
+
+// Silent refresh for guest token
+const silentRefreshGuestToken = async (): Promise<string> => {
+  // If already refreshing, return the same Promise
+  if (isRefreshingGuestToken && refreshTokenPromise) {
+    return refreshTokenPromise;
+  }
+
+  isRefreshingGuestToken = true;
+  refreshTokenPromise = (async () => {
+    try {
+      // Call /auth-status to get new guest token
+      const response = await axios.get('/auth-status', {
+        baseURL: backendBaseUrl,
+        // This request must skip the interceptor to avoid adding expired token
+        headers: { 'X-Skip-Interceptor': 'true' }
+      });
+
+      applyAiContentNoticeFlag(response.data?.ai_content_notice_enabled);
+
+      if (response.data.access_token && !response.data.auth_configured) {
+        const newToken = response.data.access_token;
+        // Update localStorage
+        localStorage.setItem('LIGHTRAG-API-TOKEN', newToken);
+        // Update auth state
+        useAuthStore.getState().login(
+          newToken,
+          true,
+          response.data.core_version,
+          response.data.api_version,
+          response.data.webui_title || null,
+          response.data.webui_description || null
+        );
+        return newToken;
+      } else {
+        throw new Error('Failed to get guest token');
+      }
+    } finally {
+      isRefreshingGuestToken = false;
+      refreshTokenPromise = null;
+    }
+  })();
+
+  return refreshTokenPromise;
+};
+
 // Interceptor: add api key and check authentication
 axiosInstance.interceptors.request.use((config) => {
+  // Skip interceptor for token refresh requests
+  if (config.headers['X-Skip-Interceptor']) {
+    delete config.headers['X-Skip-Interceptor'];
+    return config;
+  }
+
   const apiKey = useSettingsStore.getState().apiKey
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
 
@@ -300,26 +464,130 @@ axiosInstance.interceptors.request.use((config) => {
   return config
 })
 
-// Interceptor：hanle error
+// Interceptor：handle token renewal and authentication errors
+/**
+ * An HTTP error surfaced by the response interceptor.
+ *
+ * The status is carried as a property, not only inside the message: callers
+ * branch on it (e.g. the document list treats a 4xx as a permanent client
+ * error that must not trip its circuit breaker), and a plain Error left them
+ * unable to tell a 404 from a network failure.
+ */
+export type HttpRequestError = Error & { status?: number }
+
+export const toHttpRequestError = (
+  status: number,
+  statusText: string,
+  data: unknown,
+  url?: string
+): HttpRequestError => {
+  const error = new Error(
+    `${status} ${statusText}\n${JSON.stringify(data)}\n${url}`
+  ) as HttpRequestError
+  error.status = status
+  return error
+}
+
 axiosInstance.interceptors.response.use(
-  (response) => response,
-  (error: AxiosError) => {
+  (response) => {
+    // ========== Check for new token from backend ==========
+    const newToken = response.headers['x-new-token'];
+    if (newToken) {
+      localStorage.setItem('LIGHTRAG-API-TOKEN', newToken);
+
+      // Optional: log in development mode
+      if (import.meta.env.DEV) {
+        console.log('[Auth] Token auto-renewed by backend');
+      }
+
+      // Update auth state with renewal tracking.
+      //
+      // The payload MUST go through decodeBase64Url, like every other reader
+      // of a JWT here (stores/state.ts, lib/loginIdentity.ts). Bare `atob`
+      // rejects the `-`/`_` alphabet, and the catch below swallows that: the
+      // renewed token is already in localStorage by then, so the session
+      // would carry the NEW token while `lastTokenRenewal` and
+      // `tokenExpiresAt` still described the OLD one.
+      try {
+        const decodedPayload = decodeBase64Url(newToken.split('.')[1] ?? '');
+        const payload = decodedPayload === null ? {} : JSON.parse(decodedPayload);
+        const authStore = useAuthStore.getState();
+        if (authStore.isAuthenticated) {
+          // Track token renewal time and expiration
+          const renewalTime = Date.now();
+          const expiresAt = payload.exp ? payload.exp * 1000 : 0;
+          authStore.setTokenRenewal(renewalTime, expiresAt);
+
+          // Update username (usually unchanged, but just in case)
+          const newUsername = payload.sub;
+          if (newUsername && newUsername !== authStore.username) {
+            // Need to add setUsername method or just update via login
+            // For now, we'll skip username update as it's rare
+          }
+        }
+      } catch (error) {
+        console.warn('[Auth] Failed to parse renewed token:', error);
+      }
+    }
+    // ========== End of token renewal check ==========
+
+    return response;
+  },
+  async (error: AxiosError) => {
     if (error.response) {
       if (error.response?.status === 401) {
-        // For login API, throw error directly
-        if (error.config?.url?.includes('/login')) {
+        const originalRequest = error.config;
+
+        // 1. For login API, throw error directly
+        if (originalRequest?.url?.includes('/login')) {
           throw error;
         }
-        // For other APIs, navigate to login page
-        navigationService.navigateToLogin();
 
-        // return a reject Promise
-        return Promise.reject(new Error('Authentication required'));
+        // 2. Prevent infinite retry
+        if (originalRequest && (originalRequest as any)._retry) {
+          navigationService.navigateToUnauthenticated();
+          return Promise.reject(new AuthenticationRequiredError());
+        }
+
+        // 3. Check if in guest mode
+        const authStore = useAuthStore.getState();
+        const currentToken = localStorage.getItem('LIGHTRAG-API-TOKEN');
+        const isGuest = currentToken && authStore.isGuestMode;
+
+        // 4. Guest mode: silent refresh and retry
+        if (isGuest && originalRequest) {
+          try {
+            const newToken = await silentRefreshGuestToken();
+
+            // Mark as retried to prevent infinite loop
+            (originalRequest as any)._retry = true;
+
+            // Update token in request headers
+            originalRequest.headers['Authorization'] = `Bearer ${newToken}`;
+
+            // Retry original request
+            return axiosInstance(originalRequest);
+          } catch (refreshError) {
+            console.error('Failed to refresh guest token:', refreshError);
+            // Refresh failed, navigate to login
+            navigationService.navigateToUnauthenticated();
+            return Promise.reject(
+              new AuthenticationRequiredError('Failed to refresh authentication', {
+                cause: refreshError,
+              })
+            );
+          }
+        }
+
+        // 5. Non-guest mode: navigate to login page
+        navigationService.navigateToUnauthenticated();
+        return Promise.reject(new AuthenticationRequiredError());
       }
-      throw new Error(
-        `${error.response.status} ${error.response.statusText}\n${JSON.stringify(
-          error.response.data
-        )}\n${error.config?.url}`
+      throw toHttpRequestError(
+        error.response.status,
+        error.response.statusText,
+        error.response.data,
+        error.config?.url
       )
     }
     throw error
@@ -355,7 +623,13 @@ export const checkHealth = async (): Promise<
   LightragStatus | { status: 'error'; message: string }
 > => {
   try {
-    const response = await axiosInstance.get('/health')
+    // Explicit timeout: the axios instance sets none, so a backend whose
+    // event loop is blocked would leave this request hanging and the health
+    // state would neither succeed nor fail. Kept below healthCheckInterval
+    // so probes cannot pile up.
+    const response = await axiosInstance.get('/health', {
+      timeout: healthCheckTimeout * 1000
+    })
     return response.data
   } catch (error) {
     return {
@@ -365,8 +639,21 @@ export const checkHealth = async (): Promise<
   }
 }
 
-export const getDocuments = async (): Promise<DocsStatusesResponse> => {
-  const response = await axiosInstance.get('/documents')
+/**
+ * Probe whether the caller's credentials satisfy the API's combined auth.
+ * /health CANNOT serve this purpose: it sits on the default whitelist and
+ * deliberately answers "healthy" to unauthenticated callers, so it never
+ * distinguishes valid, invalid and missing API keys. /auth/verify always
+ * runs the combined dependency — a missing or wrong X-API-Key REJECTS with
+ * the standard 403 detail ("API Key required" / "Invalid API Key"), which
+ * the axios interceptor surfaces in the thrown error's message.
+ */
+export const verifyCredentials = async (): Promise<void> => {
+  await axiosInstance.get('/auth/verify')
+}
+
+export const getSupportedFileTypes = async (signal?: AbortSignal): Promise<SupportedFileTypes> => {
+  const response = await axiosInstance.get('/documents/supported_file_types', { signal })
   return response.data
 }
 
@@ -380,26 +667,123 @@ export const reprocessFailedDocuments = async (): Promise<ReprocessFailedRespons
   return response.data
 }
 
-export const getDocumentsScanProgress = async (): Promise<LightragDocumentsScanProgress> => {
-  const response = await axiosInstance.get('/documents/scan-progress')
-  return response.data
-}
-
-export const queryText = async (request: QueryRequest): Promise<QueryResponse> => {
-  const response = await axiosInstance.post('/query', request)
-  return response.data
-}
-
-export const queryTextStream = async (
+export const queryText = async (
   request: QueryRequest,
+  signal?: AbortSignal
+): Promise<QueryResponse> => {
+  const response = await axiosInstance.post('/query', request, { signal })
+  return response.data
+}
+
+/**
+ * True when an error originates from the user aborting the request (Stop
+ * button) rather than a real failure. Used to suppress error rendering and any
+ * auth-failure side effects (e.g. redirecting to login) on user cancellation.
+ */
+export const isUserAbortError = (
+  signal: AbortSignal | undefined,
+  error: unknown
+): boolean => Boolean(signal?.aborted) || (error as Error)?.name === 'AbortError'
+
+/**
+ * Read an NDJSON (application/x-ndjson) stream from a fetch Response body
+ * and dispatch each parsed line to ``onChunk`` / ``onError``.
+ *
+ * Extracted from ``queryTextStream`` so the normal path and the guest-token
+ * retry path share the same parsing logic without duplication.
+ */
+async function _readNdjsonStream(
+  response: Response,
   onChunk: (chunk: string) => void,
-  onError?: (error: string) => void
-) => {
+  onError: ((error: string) => void) | undefined,
+  onResponseTime?: (seconds: number) => void,
+  onProgress?: (event: string) => void,
+  onLlmGenerated?: (llmGenerated: boolean) => void
+): Promise<void> {
+  if (!response.body) {
+    throw new Error('Response body is null');
+  }
+
+  // One dispatcher for both readers below (the loop and the trailing buffer).
+  // `llm_generated` is checked FIRST and separately: the server carries it on
+  // the SAME line as a complete (non-streamed) response, and the caller must
+  // know what the content is before the content arrives.
+  const dispatch = (parsed: any): void => {
+    if (typeof parsed.llm_generated === 'boolean') {
+      onLlmGenerated?.(parsed.llm_generated);
+    }
+    if (parsed.response) {
+      onChunk(parsed.response);
+    } else if (parsed.error) {
+      onError?.(parsed.error);
+    } else if (parsed.response_time !== undefined && onResponseTime) {
+      onResponseTime(parsed.response_time);
+    } else if (parsed.progress && onProgress) {
+      onProgress(parsed.progress);
+    }
+    // references-only lines are silently consumed —
+    // the caller only cares about response chunks and errors.
+  };
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // Process complete lines (NDJSON)
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        try {
+          dispatch(JSON.parse(trimmed));
+        } catch {
+          // Truncated or malformed JSON — log and skip the line so one
+          // bad line does not kill the whole stream.
+          console.warn('Failed to parse NDJSON line:', trimmed.substring(0, 120));
+        }
+      }
+    }
+  } finally {
+    // Always release the reader lock, even on abort
+    try {
+      reader.releaseLock();
+    } catch {
+      // Already released or never acquired
+    }
+  }
+
+  // Process any remaining data in the buffer after the stream ends
+  if (buffer.trim()) {
+    try {
+      dispatch(JSON.parse(buffer));
+    } catch {
+      console.warn('Failed to parse final NDJSON buffer:', buffer.substring(0, 120));
+      onError?.(
+        'Response stream ended with incomplete data — the response may be truncated.'
+      );
+    }
+  }
+}
+
+/**
+ * Build auth headers for the streaming fetch request.
+ */
+function _buildStreamHeaders(): HeadersInit {
   const apiKey = useSettingsStore.getState().apiKey;
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
   const headers: HeadersInit = {
     'Content-Type': 'application/json',
-    'Accept': 'application/x-ndjson',
+    Accept: 'application/x-ndjson',
   };
   if (token) {
     headers['Authorization'] = `Bearer ${token}`;
@@ -407,171 +791,202 @@ export const queryTextStream = async (
   if (apiKey) {
     headers['X-API-Key'] = apiKey;
   }
+  return headers;
+}
 
-  try {
-    const response = await fetch(`${backendBaseUrl}/query/stream`, {
-      method: 'POST',
-      headers: headers,
-      body: JSON.stringify(request),
-    });
+/**
+ * Classify a fetch error and produce a user-friendly message for
+ * ``onError``, or ``null`` when the error should be silently swallowed
+ * (e.g. user-initiated abort).
+ */
+function _classifyStreamError(
+  error: unknown,
+  signal: AbortSignal | undefined
+): string | null {
+  if (isUserAbortError(signal, error)) {
+    return null; // Stop button — exit silently
+  }
 
-    if (!response.ok) {
-      // Handle 401 Unauthorized error specifically
-      if (response.status === 401) {
-        // For consistency with axios interceptor, navigate to login page
-        navigationService.navigateToLogin();
+  const message = errorMessage(error);
 
-        // Create a specific authentication error
-        const authError = new Error('Authentication required');
-        throw authError;
-      }
-
-      // Handle other common HTTP errors with specific messages
-      let errorBody = 'Unknown error';
-      try {
-        errorBody = await response.text(); // Try to get error details from body
-      } catch { /* ignore */ }
-
-      // Format error message similar to axios interceptor for consistency
-      const url = `${backendBaseUrl}/query/stream`;
-      throw new Error(
-        `${response.status} ${response.statusText}\n${JSON.stringify(
-          { error: errorBody }
-        )}\n${url}`
-      );
-    }
-
-    if (!response.body) {
-      throw new Error('Response body is null');
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break; // Stream finished
-      }
-
-      // Decode the chunk and add to buffer
-      buffer += decoder.decode(value, { stream: true }); // stream: true handles multi-byte chars split across chunks
-
-      // Process complete lines (NDJSON)
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || ''; // Keep potentially incomplete line in buffer
-
-      for (const line of lines) {
-        if (line.trim()) {
-          try {
-            const parsed = JSON.parse(line);
-            if (parsed.response) {
-              onChunk(parsed.response);
-            } else if (parsed.error && onError) {
-              onError(parsed.error);
-            }
-          } catch (error) {
-            console.error('Error parsing stream chunk:', line, error);
-            if (onError) onError(`Error parsing server response: ${line}`);
-          }
-        }
-      }
-    }
-
-    // Process any remaining data in the buffer after the stream ends
-    if (buffer.trim()) {
-      try {
-        const parsed = JSON.parse(buffer);
-        if (parsed.response) {
-          onChunk(parsed.response);
-        } else if (parsed.error && onError) {
-          onError(parsed.error);
-        }
-      } catch (error) {
-        console.error('Error parsing final chunk:', buffer, error);
-        if (onError) onError(`Error parsing final server response: ${buffer}`);
-      }
-    }
-
-  } catch (error) {
-    const message = errorMessage(error);
-
-    // Check if this is an authentication error
-    if (message === 'Authentication required') {
-      // Already navigated to login page in the response.status === 401 block
-      console.error('Authentication required for stream request');
-      if (onError) {
-        onError('Authentication required');
-      }
-      return; // Exit early, no need for further error handling
-    }
-
-    // Check for specific HTTP error status codes in the error message
-    const statusCodeMatch = message.match(/^(\d{3})\s/);
-    if (statusCodeMatch) {
-      const statusCode = parseInt(statusCodeMatch[1], 10);
-
-      // Handle specific status codes with user-friendly messages
-      let userMessage = message;
-
-      switch (statusCode) {
+  const statusCodeMatch = message.match(/^(\d{3})\s/);
+  if (statusCodeMatch) {
+    const statusCode = parseInt(statusCodeMatch[1], 10);
+    switch (statusCode) {
       case 403:
-        userMessage = 'You do not have permission to access this resource (403 Forbidden)';
-        console.error('Permission denied for stream request:', message);
-        break;
+        // A 403 raised by the API-key check must KEEP that detail: the
+        // workspace entry recognizes these messages to re-probe credentials
+        // and reopen its API-key dialog, which is the only way back in after
+        // a key is rotated (and streaming is the default query mode, so
+        // flattening them here disabled that path entirely). Unrelated 403s
+        // keep the generic wording.
+        if (message.includes(InvalidApiKeyError)) {
+          return `${InvalidApiKeyError} (403 Forbidden)`;
+        }
+        if (message.includes(RequireApiKeError)) {
+          return `${RequireApiKeError} (403 Forbidden)`;
+        }
+        return 'You do not have permission to access this resource (403 Forbidden)';
       case 404:
-        userMessage = 'The requested resource does not exist (404 Not Found)';
-        console.error('Resource not found for stream request:', message);
-        break;
+        return 'The requested resource does not exist (404 Not Found)';
       case 429:
-        userMessage = 'Too many requests, please try again later (429 Too Many Requests)';
-        console.error('Rate limited for stream request:', message);
-        break;
+        return 'Too many requests, please try again later (429 Too Many Requests)';
       case 500:
       case 502:
       case 503:
       case 504:
-        userMessage = `Server error, please try again later (${statusCode})`;
-        console.error('Server error for stream request:', message);
-        break;
+        return `Server error, please try again later (${statusCode})`;
       default:
-        console.error('Stream request failed with status code:', statusCode, message);
-      }
+        return message;
+    }
+  }
 
-      if (onError) {
-        onError(userMessage);
+  if (
+    message.includes('NetworkError') ||
+    message.includes('Failed to fetch') ||
+    message.includes('Network request failed')
+  ) {
+    return 'Network connection error, please check your internet connection';
+  }
+
+  if (message.includes('Error parsing') || message.includes('SyntaxError')) {
+    return 'Error processing response data';
+  }
+
+  return message;
+}
+
+/**
+ * Format a non-ok streaming ``Response`` into the canonical error string that
+ * ``_classifyStreamError`` understands (``"<status> <statusText>\n{...}\n<url>"``)
+ * and throw it. Always throws — the return type is ``never``.
+ *
+ * Shared by the first response and the refreshed-retry response so that an
+ * HTTP error (403/429/5xx, …) is classified identically on both paths.
+ */
+async function _throwStreamHttpError(response: Response): Promise<never> {
+  let errorBody = 'Unknown error';
+  try {
+    errorBody = await response.text();
+  } catch {
+    /* ignore */
+  }
+  throw new Error(
+    `${response.status} ${response.statusText}\n${JSON.stringify({ error: errorBody })}\n${backendBaseUrl}/query/stream`
+  );
+}
+
+export const queryTextStream = async (
+  request: QueryRequest,
+  onChunk: (chunk: string) => void,
+  onError?: (error: string) => void,
+  signal?: AbortSignal,
+  onResponseTime?: (seconds: number) => void,
+  onProgress?: (event: string) => void,
+  // Reports the server's verdict on whether the answering LLM wrote the
+  // content of a complete (non-streamed) response line. Streamed chunks carry
+  // no flag — they always come from the LLM.
+  onLlmGenerated?: (llmGenerated: boolean) => void
+) => {
+  const headers = _buildStreamHeaders();
+
+  try {
+    const response = await fetch(`${backendBaseUrl}/query/stream`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(request),
+      signal,
+    });
+
+    // The response whose body we ultimately read — replaced by the retry
+    // response when a guest token is silently refreshed below.
+    let activeResponse = response;
+
+    if (!response.ok) {
+      // --- 401 guest-token retry -------------------------------------------
+      if (response.status === 401) {
+        const currentToken = localStorage.getItem('LIGHTRAG-API-TOKEN');
+        const isGuest =
+          currentToken && useAuthStore.getState().isGuestMode;
+
+        if (isGuest) {
+          // Only the token refresh + retry fetch are guarded here: a failure
+          // of the refresh itself (or a user abort) is an auth problem and
+          // routes to login. The retried HTTP *response*, however, is handled
+          // with the same logic as the first response below, so a 403/429/5xx
+          // on retry is classified by the outer catch rather than mislabelled
+          // as an auth-refresh failure.
+          let retryResponse: Response;
+          try {
+            const newToken = await silentRefreshGuestToken();
+            const retryHeaders: Record<string, string> = { ...(headers as Record<string, string>) };
+            retryHeaders['Authorization'] = `Bearer ${newToken}`;
+
+            retryResponse = await fetch(`${backendBaseUrl}/query/stream`, {
+              method: 'POST',
+              headers: retryHeaders,
+              body: JSON.stringify(request),
+              signal,
+            });
+          } catch (refreshError) {
+            if (isUserAbortError(signal, refreshError)) {
+              return;
+            }
+            console.error(
+              'Failed to refresh guest token for streaming:',
+              refreshError
+            );
+            navigationService.navigateToUnauthenticated();
+            throw new AuthenticationRequiredError('Failed to refresh authentication', {
+              cause: refreshError,
+            });
+          }
+
+          if (!retryResponse.ok) {
+            if (retryResponse.status === 401) {
+              // Refreshed token still rejected → genuine auth failure
+              navigationService.navigateToUnauthenticated();
+              throw new AuthenticationRequiredError();
+            }
+            // Non-auth HTTP error on retry → classify like the first response
+            await _throwStreamHttpError(retryResponse);
+          }
+
+          activeResponse = retryResponse;
+        } else {
+          // Non-guest 401 → login
+          navigationService.navigateToUnauthenticated();
+          throw new AuthenticationRequiredError();
+        }
+      } else {
+        // --- Other HTTP errors ---------------------------------------------
+        await _throwStreamHttpError(response);
       }
-      return;
     }
 
-    // Handle network errors (like connection refused, timeout, etc.)
-    if (message.includes('NetworkError') ||
-        message.includes('Failed to fetch') ||
-        message.includes('Network request failed')) {
-      console.error('Network error for stream request:', message);
-      if (onError) {
-        onError('Network connection error, please check your internet connection');
-      }
-      return;
+    // --- Read the NDJSON stream (happy path or refreshed retry) ------------
+    await _readNdjsonStream(
+      activeResponse,
+      onChunk,
+      onError,
+      onResponseTime,
+      onProgress,
+      onLlmGenerated
+    );
+  } catch (error) {
+    // Auth termination is NOT an answer failure: navigation to the entry's
+    // unauthenticated route already happened above. Rethrow the typed error
+    // so the query session ends quietly instead of rendering it as an
+    // assistant error via onError.
+    if (isAuthenticationRequiredError(error)) {
+      throw error;
     }
-
-    // Handle JSON parsing errors during stream processing
-    if (message.includes('Error parsing') || message.includes('SyntaxError')) {
-      console.error('JSON parsing error in stream:', message);
-      if (onError) {
-        onError('Error processing response data');
-      }
-      return;
+    const classified = _classifyStreamError(error, signal);
+    if (classified === null) {
+      return; // User abort — silent exit
     }
-
-    // Handle other errors
-    console.error('Unhandled stream error:', message);
-    if (onError) {
-      onError(message);
-    } else {
-      console.error('No error handler provided for stream error:', message);
-    }
+    console.error('Stream request error:', classified);
+    onError?.(classified);
   }
 };
 
@@ -621,16 +1036,21 @@ export const batchUploadDocuments = async (
   )
 }
 
-export const clearDocuments = async (): Promise<DocActionResponse> => {
-  const response = await axiosInstance.delete('/documents')
-  return response.data
-}
-
-export const clearCache = async (): Promise<{
-  status: 'success' | 'fail'
-  message: string
-}> => {
-  const response = await axiosInstance.post('/documents/clear_cache', {})
+/**
+ * Clears every document from the RAG system.
+ *
+ * `clearLlmCache` folds what used to be a separate POST /documents/clear_cache
+ * into this call, so dropping the cache runs inside the destructive pipeline
+ * reservation this endpoint already takes. Off by default: the cache survives
+ * a clear so re-adding the same documents reuses the extraction results
+ * already paid for.
+ */
+export const clearDocuments = async (
+  clearLlmCache: boolean = false
+): Promise<DocActionResponse> => {
+  const response = await axiosInstance.delete('/documents', {
+    params: { clear_llm_cache: clearLlmCache }
+  })
   return response.data
 }
 
@@ -656,7 +1076,8 @@ export const getAuthStatus = async (): Promise<AuthStatusResponse> => {
     });
 
     // Check if response is HTML (which indicates a redirect or wrong endpoint)
-    const contentType = response.headers['content-type'] || '';
+    const contentTypeHeader = response.headers['content-type'];
+    const contentType = typeof contentTypeHeader === 'string' ? contentTypeHeader : '';
     if (contentType.includes('text/html')) {
       console.warn('Received HTML response instead of JSON for auth-status endpoint');
       return {
@@ -664,6 +1085,12 @@ export const getAuthStatus = async (): Promise<AuthStatusResponse> => {
         auth_mode: 'enabled'
       };
     }
+
+    // Deployment display configuration the caller never looks at: adopted here,
+    // once, before the validation below picks one of its several return shapes
+    // (this is the request BOTH entries make at boot, so it is the one place
+    // that covers the admin shell, the login page and the workspace entry).
+    applyAiContentNoticeFlag(response.data?.ai_content_notice_enabled);
 
     // Strict validation of the response data
     if (response.data &&
@@ -703,7 +1130,9 @@ export const getAuthStatus = async (): Promise<AuthStatusResponse> => {
 }
 
 export const getPipelineStatus = async (): Promise<PipelineStatusResponse> => {
-  const response = await axiosInstance.get('/documents/pipeline_status')
+  const response = await axiosInstance.get('/documents/pipeline_status', {
+    timeout: pipelineStatusTimeout * 1000
+  })
   return response.data
 }
 
@@ -716,15 +1145,16 @@ export const cancelPipeline = async (): Promise<{
 }
 
 export const loginToServer = async (username: string, password: string): Promise<LoginResponse> => {
-  const formData = new FormData();
+  const formData = new URLSearchParams();
   formData.append('username', username);
   formData.append('password', password);
+  formData.append('grant_type', 'password');
 
   const response = await axiosInstance.post('/login', formData, {
-    headers: {
-      'Content-Type': 'multipart/form-data'
-    }
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
   });
+
+  applyAiContentNoticeFlag(response.data?.ai_content_notice_enabled);
 
   return response.data;
 }
@@ -797,21 +1227,182 @@ export const getTrackStatus = async (trackId: string): Promise<TrackStatusRespon
   return response.data
 }
 
+type InFlightPaginatedDocumentRequest = {
+  controller: AbortController
+  promise: Promise<PaginatedDocsResponse>
+  subscriberCount: number
+}
+
+const getPaginatedDocumentsRequestKey = (request: DocumentsRequest): string =>
+  JSON.stringify(request)
+
+// Deduplicate in-flight paginated document requests with identical parameters.
+// This prevents duplicate backend calls caused by overlapping timers/effects or
+// React StrictMode double-mount behavior in development.
+const inFlightPaginatedDocumentRequests = new Map<
+  string,
+  InFlightPaginatedDocumentRequest
+>()
+
+const releasePaginatedDocumentSubscriber = (
+  requestKey: string,
+  requestEntry: InFlightPaginatedDocumentRequest,
+  abortIfLastSubscriber: boolean
+): void => {
+  requestEntry.subscriberCount = Math.max(0, requestEntry.subscriberCount - 1)
+
+  if (requestEntry.subscriberCount !== 0) {
+    return
+  }
+
+  if (inFlightPaginatedDocumentRequests.get(requestKey) === requestEntry) {
+    inFlightPaginatedDocumentRequests.delete(requestKey)
+  }
+
+  if (abortIfLastSubscriber) {
+    requestEntry.controller.abort()
+  }
+}
+
+const subscribeToPaginatedDocumentsRequest = (
+  request: DocumentsRequest
+): {
+  requestKey: string
+  requestEntry: InFlightPaginatedDocumentRequest
+  release: (abortIfLastSubscriber: boolean) => void
+} => {
+  const requestKey = getPaginatedDocumentsRequestKey(request)
+  let requestEntry = inFlightPaginatedDocumentRequests.get(requestKey)
+
+  if (!requestEntry) {
+    const controller = new AbortController()
+    requestEntry = {
+      controller,
+      subscriberCount: 0,
+      promise: paginatedDocumentsPost(request, controller)
+        .finally(() => {
+          if (inFlightPaginatedDocumentRequests.get(requestKey) === requestEntry) {
+            inFlightPaginatedDocumentRequests.delete(requestKey)
+          }
+        })
+    }
+    inFlightPaginatedDocumentRequests.set(requestKey, requestEntry)
+  }
+
+  requestEntry.subscriberCount += 1
+
+  let released = false
+  const release = (abortIfLastSubscriber: boolean): void => {
+    if (released) {
+      return
+    }
+    released = true
+    releasePaginatedDocumentSubscriber(
+      requestKey,
+      requestEntry,
+      abortIfLastSubscriber
+    )
+  }
+
+  return {
+    requestKey,
+    requestEntry,
+    release
+  }
+}
+
+const defaultPaginatedDocumentsPost = async (
+  request: DocumentsRequest,
+  controller: AbortController
+): Promise<PaginatedDocsResponse> => {
+  const response = await axiosInstance.post('/documents/paginated', request, {
+    signal: controller.signal
+  })
+  return response.data
+}
+
+let paginatedDocumentsPost = defaultPaginatedDocumentsPost
+
+export const abortDocumentsPaginated = (request: DocumentsRequest): void => {
+  const requestKey = getPaginatedDocumentsRequestKey(request)
+  const inFlightRequest = inFlightPaginatedDocumentRequests.get(requestKey)
+
+  if (!inFlightRequest) {
+    return
+  }
+
+  inFlightPaginatedDocumentRequests.delete(requestKey)
+  inFlightRequest.controller.abort()
+}
+
+export const __resetPaginatedDocumentRequestsForTests = (): void => {
+  for (const { controller } of inFlightPaginatedDocumentRequests.values()) {
+    controller.abort()
+  }
+  inFlightPaginatedDocumentRequests.clear()
+  paginatedDocumentsPost = defaultPaginatedDocumentsPost
+}
+
+export const __setPaginatedDocumentsPostForTests = (
+  post: typeof defaultPaginatedDocumentsPost
+): void => {
+  paginatedDocumentsPost = post
+}
+
+/**
+ * Swap the axios adapter so a test can drive a response (or an HTTP failure)
+ * through the real request/response interceptors. Pass undefined to restore.
+ */
+export const __setAxiosAdapterForTests = (adapter: any): void => {
+  axiosInstance.defaults.adapter = adapter
+}
+
 /**
  * Get documents with pagination support
  * @param request The pagination request parameters
  * @returns Promise with paginated documents response
  */
 export const getDocumentsPaginated = async (request: DocumentsRequest): Promise<PaginatedDocsResponse> => {
-  const response = await axiosInstance.post('/documents/paginated', request)
-  return response.data
+  const { requestEntry, release } = subscribeToPaginatedDocumentsRequest(request)
+
+  try {
+    return await requestEntry.promise
+  } finally {
+    release(false)
+  }
 }
 
-/**
- * Get counts of documents by status
- * @returns Promise with status counts response
- */
-export const getDocumentStatusCounts = async (): Promise<StatusCountsResponse> => {
-  const response = await axiosInstance.get('/documents/status_counts')
-  return response.data
+export const getDocumentsPaginatedWithTimeout = (
+  request: DocumentsRequest,
+  timeoutMs: number = 30000,
+  errorMsg: string = documentFetchTimeoutMessage
+): Promise<PaginatedDocsResponse> => {
+  const { requestEntry, release } = subscribeToPaginatedDocumentsRequest(request)
+
+  return new Promise<PaginatedDocsResponse>((resolve, reject) => {
+    let timedOut = false
+    const timeoutId = setTimeout(() => {
+      timedOut = true
+      release(true)
+      reject(new Error(errorMsg))
+    }, timeoutMs)
+
+    requestEntry.promise
+      .then(response => {
+        if (timedOut) {
+          return
+        }
+        clearTimeout(timeoutId)
+        release(false)
+        resolve(response)
+      })
+      .catch(error => {
+        if (timedOut) {
+          return
+        }
+        clearTimeout(timeoutId)
+        release(false)
+        reject(error)
+      })
+  })
 }

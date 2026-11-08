@@ -1,4 +1,4 @@
-import { ReactNode, useEffect, useMemo, useRef, memo, useState } from 'react' // Import useMemo
+import { ComponentProps, ReactNode, useEffect, useMemo, useRef, memo, useState } from 'react' // Import useMemo
 import { Message } from '@/api/lightrag'
 import useTheme from '@/hooks/useTheme'
 import { cn } from '@/lib/utils'
@@ -7,16 +7,19 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeReact from 'rehype-react'
 import rehypeRaw from 'rehype-raw'
+import rehypeSanitize from 'rehype-sanitize'
 import remarkMath from 'remark-math'
-import mermaid from 'mermaid'
 import { remarkFootnotes } from '@/utils/remarkFootnotes'
+import { chatMarkdownSanitizeSchema } from '@/utils/markdownSanitizeSchema'
 
 
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { oneLight, oneDark } from 'react-syntax-highlighter/dist/cjs/styles/prism'
 
-import { LoaderIcon, ChevronDownIcon } from 'lucide-react'
+import { LoaderIcon, ChevronDownIcon, ClockIcon, ZapIcon } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+import { useAiContentNoticeStore } from '@/stores/aiContentNotice'
+import { shouldShowAiContentNotice } from '@/lib/aiContentNotice'
 
 // KaTeX configuration options interface
 interface KaTeXOptions {
@@ -28,45 +31,70 @@ interface KaTeXOptions {
   errorCallback?: (error: string, latex: string) => void;
 }
 
-export type MessageWithError = Message & {
-  id: string // Unique identifier for stable React keys
-  isError?: boolean
-  isThinking?: boolean // Flag to indicate if the message is in a "thinking" state
-  /**
-   * Indicates if the mermaid diagram in this message has been rendered.
-   * Used to persist the rendering state across updates and prevent flickering.
-   */
-  mermaidRendered?: boolean
-  /**
-   * Indicates if the LaTeX formulas in this message are complete and ready for rendering.
-   * Used to prevent red error text during streaming of incomplete LaTeX formulas.
-   */
-  latexRendered?: boolean
-}
+// MessageWithError moved to the retrieval types module so the UI-free query
+// session controller does not depend on this rendering component; re-exported
+// here for existing importers.
+import type { MessageWithError } from '@/types/retrieval'
+export type { MessageWithError } from '@/types/retrieval'
+
+// Kept out of this file so tests can stub the load without mocking the
+// `mermaid` package process-wide; see `mermaidLoader.ts`.
+import { loadMermaid } from './mermaidLoader'
+
+
+/**
+ * Tables scroll INSIDE their own block. The message list scrolls vertically
+ * only (see MessageList), so a table wider than the conversation column would
+ * otherwise be clipped and unreachable on a narrow screen.
+ */
+const ScrollableTable = ({ children }: { children?: ReactNode }) => (
+  <div className="my-2 max-w-full overflow-x-auto">
+    <table>{children}</table>
+  </div>
+)
 
 // Restore original component definition and export
 export const ChatMessage = ({
   message,
-  isTabActive = true
+  isTabActive = true,
+  activeProgress = null,
+  isQuerying = false
 }: {
   message: MessageWithError
   isTabActive?: boolean
+  activeProgress?: string | null
+  // True while this message's query is still in flight (from submit until the
+  // finally/stop handler). Drives the clock's spin so it animates for the whole
+  // query, not just the thinking phase.
+  isQuerying?: boolean
 }) => {
   const { t } = useTranslation()
   const { theme } = useTheme()
+  // Deployment-level switch (ENABLE_AI_CONTENT_NOTICE), read from the server at
+  // boot. Both query entries render answers through this component, so gating
+  // it here is what covers /webui and /workspace alike.
+  const aiContentNoticeEnabled = useAiContentNoticeStore((state) => state.enabled)
   const [katexPlugin, setKatexPlugin] = useState<((options?: KaTeXOptions) => any) | null>(null)
   const [isThinkingExpanded, setIsThinkingExpanded] = useState<boolean>(false)
 
   // Directly use props passed from the parent.
-  const { thinkingContent, displayContent, thinkingTime, isThinking } = message
+  const { thinkingContent, displayContent, thinkingTime, responseTime, firstTokenTime, isThinking } = message
 
-  // Reset expansion state when new thinking starts
-  useEffect(() => {
+  // Reset expansion state when new thinking starts.
+  // Render-time comparison avoids cascading renders from setState-in-useEffect.
+  const [previousThinkingState, setPreviousThinkingState] = useState({
+    isThinking,
+    messageId: message.id
+  })
+  if (
+    previousThinkingState.isThinking !== isThinking ||
+    previousThinkingState.messageId !== message.id
+  ) {
+    setPreviousThinkingState({ isThinking, messageId: message.id })
     if (isThinking) {
-      // When thinking starts, always reset to collapsed state
       setIsThinkingExpanded(false)
     }
-  }, [isThinking, message.id])
+  }
 
   // The content to display is now non-ambiguous.
   const finalThinkingContent = thinkingContent
@@ -76,7 +104,8 @@ export const ChatMessage = ({
     ? message.content
     : (displayContent !== undefined ? displayContent : (message.content || ''))
 
-  // Load KaTeX dynamically
+  // Load KaTeX rehype plugin dynamically
+  // Note: KaTeX extensions (mhchem, copy-tex) are imported statically in main.tsx
   useEffect(() => {
     const loadKaTeX = async () => {
       try {
@@ -84,7 +113,6 @@ export const ChatMessage = ({
         setKatexPlugin(() => rehypeKatex);
       } catch (error) {
         console.error('Failed to load KaTeX plugin:', error);
-        // Set to null to ensure we don't try to use a failed plugin
         setKatexPlugin(null);
       }
     };
@@ -136,13 +164,74 @@ export const ChatMessage = ({
     h4: ({ children }: { children?: ReactNode }) => <h4 className="text-base font-semibold mt-3 mb-2">{children}</h4>,
     ul: ({ children }: { children?: ReactNode }) => <ul className="list-disc pl-5 my-2">{children}</ul>,
     ol: ({ children }: { children?: ReactNode }) => <ol className="list-decimal pl-5 my-2">{children}</ol>,
-    li: ({ children }: { children?: ReactNode }) => <li className="my-1">{children}</li>
+    li: ({ children }: { children?: ReactNode }) => <li className="my-1">{children}</li>,
+    table: ScrollableTable
   }), [message.mermaidRendered, message.role]);
 
   const thinkingMarkdownComponents = useMemo(() => ({
-    code: (props: any) => (<CodeHighlight {...props} renderAsDiagram={message.mermaidRendered ?? false} messageRole={message.role} />)
+    code: (props: any) => (<CodeHighlight {...props} renderAsDiagram={message.mermaidRendered ?? false} messageRole={message.role} />),
+    table: ScrollableTable
   }), [message.mermaidRendered, message.role]);
 
+  // Whether the assistant has begun emitting visible answer text. Drives both
+  // where the timing row is placed and whether retrieval progress is shown.
+  const hasContent = !!finalDisplayContent && finalDisplayContent.trim() !== ''
+
+  // AI-generated content notice (ENABLE_AI_CONTENT_NOTICE): a trailing item on
+  // the meta row below the answer, never a line of its own. What may carry the
+  // label is decided by the query session and travels on the message
+  // (`aiGenerated`) — a context-only debug response is not generated, while a
+  // stream that failed after emitting real answer text still is. It lives
+  // outside the markdown and outside `message.content`, so it never reaches
+  // the copy button, the retrieval history or the API response.
+  const aiContentNotice = shouldShowAiContentNotice({
+    enabled: aiContentNoticeEnabled,
+    role: message.role,
+    aiGenerated: message.aiGenerated,
+    hasContent
+  }) ? (
+      <span className="italic" data-testid="ai-content-notice">
+        {t('retrievePanel.chatMessage.aiContentNotice')}
+      </span>
+    ) : null
+
+  // Response time (+ first-token time) row. While no answer text exists yet it
+  // sits above the "Thinking..." hint (so the time stays put as the hint
+  // appears below it); once content arrives it is relocated to the end of the
+  // answer. Retrieval progress trails on the same line, but only before any
+  // answer text is shown; the AI-content notice trails it only AFTER content
+  // exists, so the two never share the line. `flex-wrap` keeps the notice from
+  // pushing the row past a phone-width bubble.
+  const timingRow =
+    message.role === 'assistant' && typeof responseTime === 'number' ? (
+      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
+        <span className="flex items-center gap-1 tabular-nums">
+          <ClockIcon className={cn('size-3', isQuerying && 'animate-spin')} />
+          {t('retrievePanel.chatMessage.responseTime', { time: responseTime.toFixed(1) })}
+        </span>
+        {typeof firstTokenTime === 'number' && (
+          <span className="flex items-center gap-1 tabular-nums">
+            <ZapIcon className="size-3" />
+            {t('retrievePanel.chatMessage.firstTokenTime', { time: firstTokenTime.toFixed(1) })}
+          </span>
+        )}
+        {!hasContent && activeProgress && (
+          // Progress trails the time as a parenthesised note (no spinner — the
+          // "Thinking..." hint above already carries one, so a second would be
+          // redundant).
+          <span className="text-muted-foreground/70">
+            ({t(`retrievePanel.chatMessage.progress.${activeProgress}`, activeProgress)})
+          </span>
+        )}
+        {aiContentNotice}
+      </div>
+    ) : null
+
+  // The bubble shares its flex row with a fixed-width copy button (24px plus
+  // an 8px gap), and its percentage width knows nothing about that. `min-w-0`
+  // is therefore required, not cosmetic: without it the flex item's automatic
+  // minimum size pins the bubble at 95% and the row overflows by ~32px on a
+  // phone-width screen.
   return (
     <div
       className={`${
@@ -151,8 +240,12 @@ export const ChatMessage = ({
           : message.isError
             ? 'w-[95%] bg-red-100 text-red-600 dark:bg-red-950 dark:text-red-400'
             : 'w-[95%] bg-muted'
-      } rounded-lg px-4 py-2`}
+      } min-w-0 rounded-lg px-4 py-2`}
     >
+      {/* Before any answer text: the timing row sits on top and the thinking
+          hint appears beneath it, so the time doesn't jump when "Thinking..."
+          shows up. Once content arrives, the row moves below the answer. */}
+      {!hasContent && timingRow}
       {/* Thinking process display - only for assistant messages */}
       {/* Always render to prevent layout shift when switching tabs */}
       {message.role === 'assistant' && (isThinking || thinkingTime !== null) && (
@@ -162,7 +255,17 @@ export const ChatMessage = ({
           !isTabActive && 'opacity-50'
         )}>
           <div
-            className="flex items-center text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition-colors duration-200 text-sm cursor-pointer select-none"
+            // Indent by 1rem ONLY while the timing row sits directly above this
+            // line (i.e. no answer text yet): there the clock icon (size-3) +
+            // gap-1 push the time label right by exactly 1rem, so the same
+            // margin lines the two labels up. Once content arrives the timing
+            // row moves below the answer, so the thinking line drops the indent
+            // and aligns left with the answer instead. (The thinking spinner is
+            // dropped — the timing row's clock already animates while thinking.)
+            className={cn(
+              'flex items-center text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition-colors duration-200 text-sm cursor-pointer select-none',
+              !hasContent && 'ml-4'
+            )}
             onClick={() => {
               // Allow expansion when there's thinking content, even during thinking process
               if (finalThinkingContent && finalThinkingContent.trim() !== '') {
@@ -171,11 +274,7 @@ export const ChatMessage = ({
             }}
           >
             {isThinking ? (
-              <>
-                {/* Only show spinner animation in active tab to save resources */}
-                {isTabActive && <LoaderIcon className="mr-2 size-4 animate-spin" />}
-                <span>{t('retrievePanel.chatMessage.thinking')}</span>
-              </>
+              <span>{t('retrievePanel.chatMessage.thinking')}</span>
             ) : (
               typeof thinkingTime === 'number' && <span>{t('retrievePanel.chatMessage.thinkingTime', { time: thinkingTime })}</span>
             )}
@@ -194,12 +293,16 @@ export const ChatMessage = ({
                 remarkPlugins={[remarkGfm, remarkFootnotes, remarkMath]}
                 rehypePlugins={[
                   rehypeRaw,
+                  // Thinking content is untrusted (derived from ingested
+                  // documents); sanitize the raw HTML rehypeRaw just parsed
+                  // before it can render (GHSA-xpjq-3w4w-w5wr).
+                  [rehypeSanitize, chatMarkdownSanitizeSchema],
                   ...((katexPlugin && (message.latexRendered ?? true)) ? [[katexPlugin, {
                     errorColor: theme === 'dark' ? '#ef4444' : '#dc2626',
                     throwOnError: false,
                     displayMode: false,
                     strict: false,
-                    trust: true,
+                    trust: false,
                     // Add silent error handling to avoid console noise
                     errorCallback: (error: string, latex: string) => {
                       // Only show detailed errors in development environment
@@ -219,58 +322,119 @@ export const ChatMessage = ({
           )}
         </div>
       )}
-      {/* Main content display */}
+      {/* Main content display. Isolated in a memo'd component so the message's
+          100ms stopwatch re-render (which only changes the timing row) does NOT
+          re-run the markdown / syntax-highlight / KaTeX pipeline over the whole
+          answer — it re-renders only when content/theme/latex/role change. */}
       {finalDisplayContent && (
-        <div className="relative">
-          <ReactMarkdown
-            className={`prose dark:prose-invert max-w-none text-sm break-words prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-1 [&_.katex]:text-current [&_.katex-display]:my-4 [&_.katex-display]:max-w-full [&_.katex-display_>.base]:overflow-x-auto [&_sup]:text-[0.75em] [&_sup]:align-[0.1em] [&_sup]:leading-[0] [&_sub]:text-[0.75em] [&_sub]:align-[-0.2em] [&_sub]:leading-[0] [&_mark]:bg-yellow-200 [&_mark]:dark:bg-yellow-800 [&_u]:underline [&_del]:line-through [&_ins]:underline [&_ins]:decoration-green-500 [&_.footnotes]:mt-8 [&_.footnotes]:pt-4 [&_.footnotes]:border-t [&_.footnotes_ol]:text-sm [&_.footnotes_li]:my-1 ${
-              message.role === 'user' ? 'text-primary-foreground' : 'text-foreground'
-            } ${
-              message.role === 'user'
-                ? '[&_.footnotes]:border-primary-foreground/30 [&_a[href^="#fn"]]:text-primary-foreground [&_a[href^="#fn"]]:no-underline [&_a[href^="#fn"]]:hover:underline [&_a[href^="#fnref"]]:text-primary-foreground [&_a[href^="#fnref"]]:no-underline [&_a[href^="#fnref"]]:hover:underline'
-                : '[&_.footnotes]:border-border [&_a[href^="#fn"]]:text-primary [&_a[href^="#fn"]]:no-underline [&_a[href^="#fn"]]:hover:underline [&_a[href^="#fnref"]]:text-primary [&_a[href^="#fnref"]]:no-underline [&_a[href^="#fnref"]]:hover:underline'
-            }`}
-            remarkPlugins={[remarkGfm, remarkFootnotes, remarkMath]}
-            rehypePlugins={[
-              rehypeRaw,
-              ...((katexPlugin && (message.latexRendered ?? true)) ? [[
-                katexPlugin,
-                {
-                  errorColor: theme === 'dark' ? '#ef4444' : '#dc2626',
-                  throwOnError: false,
-                  displayMode: false,
-                  strict: false,
-                  trust: true,
-                  // Add silent error handling to avoid console noise
-                  errorCallback: (error: string, latex: string) => {
-                    // Only show detailed errors in development environment
-                    if (process.env.NODE_ENV === 'development') {
-                      console.warn('KaTeX rendering error in main content:', error, 'for LaTeX:', latex);
-                    }
-                  }
-                }
-              ] as any] : []),
-              rehypeReact
-            ]}
-            skipHtml={false}
-            components={mainMarkdownComponents}
-          >
-            {finalDisplayContent}
-          </ReactMarkdown>
+        <MessageMarkdown
+          content={finalDisplayContent}
+          components={mainMarkdownComponents}
+          katexPlugin={katexPlugin}
+          theme={theme}
+          latexRendered={message.latexRendered ?? true}
+          role={message.role}
+        />
+      )}
+      {/* Once answer text has started, the timing row follows at the end of
+          the answer (progress is already hidden by then). */}
+      {hasContent && timingRow}
+      {/* User-terminated hint - response may be incomplete */}
+      {message.isAborted && (
+        <div className="mt-1 text-xs italic text-muted-foreground">
+          {t('retrievePanel.retrieval.userTerminated')}
         </div>
       )}
-      {/* Loading indicator - only show in active tab */}
-      {isTabActive && (() => {
+      {/* Answers restored from the retrieval history carry no timing, so the
+          notice would have nowhere to sit. It then gets the same row on its
+          own rather than being dropped. */}
+      {!timingRow && aiContentNotice && (
+        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
+          {aiContentNotice}
+        </div>
+      )}
+      {/* Loading indicator — only in the active tab, and only as a fallback when
+          the timing row isn't already on screen. During a query the timing row
+          shows a live stopwatch + retrieval progress, so this bare spinner would
+          be a redundant second animation; suppress it whenever timingRow renders
+          (i.e. an assistant message with a response time). */}
+      {isTabActive && !message.isAborted && (() => {
         // More comprehensive loading state check
         const hasVisibleContent = finalDisplayContent && finalDisplayContent.trim() !== '';
-        const isLoadingState = !hasVisibleContent && !isThinking && !thinkingTime;
+        const isLoadingState = !hasVisibleContent && !isThinking && !thinkingTime && !timingRow;
         return isLoadingState && <LoaderIcon className="animate-spin duration-2000" />
       })()}
     </div>
   )
 }
 
-// Remove the incorrect memo export line
+// Main answer markdown, isolated behind memo so the 100ms stopwatch re-render
+// of a message (which only touches the timing row) does NOT re-run the markdown
+// / syntax-highlight / KaTeX pipeline over the whole answer. All props are
+// stable across timer ticks, so this re-renders only when the content (or
+// theme / latex-readiness / role) actually changes.
+const MessageMarkdown = memo(function MessageMarkdown({
+  content,
+  components,
+  katexPlugin,
+  theme,
+  latexRendered,
+  role
+}: {
+  content: string
+  components: ComponentProps<typeof ReactMarkdown>['components']
+  katexPlugin: ((options?: KaTeXOptions) => any) | null
+  theme: string
+  latexRendered: boolean
+  role: Message['role']
+}) {
+  return (
+    <div className="relative">
+      <div className={`prose dark:prose-invert max-w-none text-sm break-words prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-1 [&_.katex]:text-current [&_.katex-display]:my-4 [&_.katex-display]:max-w-full [&_.katex-display_>.base]:overflow-x-auto [&_sup]:text-[0.75em] [&_sup]:align-[0.1em] [&_sup]:leading-[0] [&_sub]:text-[0.75em] [&_sub]:align-[-0.2em] [&_sub]:leading-[0] [&_mark]:bg-yellow-200 [&_mark]:dark:bg-yellow-800 [&_u]:underline [&_del]:line-through [&_ins]:underline [&_ins]:decoration-green-500 [&_.footnotes]:mt-8 [&_.footnotes]:pt-4 [&_.footnotes]:border-t [&_.footnotes_ol]:text-sm [&_.footnotes_li]:my-1 ${
+        role === 'user'
+          ? 'text-primary-foreground prose-inherit-color'
+          : 'text-foreground'
+      } ${
+        role === 'user'
+          ? '[&_.footnotes]:border-primary-foreground/30 [&_a[href^="#fn"]]:text-primary-foreground [&_a[href^="#fn"]]:no-underline [&_a[href^="#fn"]]:hover:underline [&_a[href^="#fnref"]]:text-primary-foreground [&_a[href^="#fnref"]]:no-underline [&_a[href^="#fnref"]]:hover:underline'
+          : '[&_.footnotes]:border-border [&_a[href^="#fn"]]:text-primary [&_a[href^="#fn"]]:no-underline [&_a[href^="#fn"]]:hover:underline [&_a[href^="#fnref"]]:text-primary [&_a[href^="#fnref"]]:no-underline [&_a[href^="#fnref"]]:hover:underline'
+      }`}>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm, remarkFootnotes, remarkMath]}
+          rehypePlugins={[
+            rehypeRaw,
+            // Answer content is untrusted (derived from ingested documents);
+            // sanitize the raw HTML rehypeRaw just parsed before it can render
+            // (GHSA-xpjq-3w4w-w5wr).
+            [rehypeSanitize, chatMarkdownSanitizeSchema],
+            ...((katexPlugin && latexRendered) ? [[
+              katexPlugin,
+              {
+                errorColor: theme === 'dark' ? '#ef4444' : '#dc2626',
+                throwOnError: false,
+                displayMode: false,
+                strict: false,
+                trust: false,
+                // Add silent error handling to avoid console noise
+                errorCallback: (error: string, latex: string) => {
+                  // Only show detailed errors in development environment
+                  if (process.env.NODE_ENV === 'development') {
+                    console.warn('KaTeX rendering error in main content:', error, 'for LaTeX:', latex);
+                  }
+                }
+              }
+            ] as any] : []),
+            rehypeReact
+          ]}
+          skipHtml={false}
+          components={components}
+        >
+          {content}
+        </ReactMarkdown>
+      </div>
+    </div>
+  )
+})
 
 interface CodeHighlightProps {
   inline?: boolean
@@ -313,18 +477,55 @@ const CodeHighlight = memo(({ inline, className, children, renderAsDiagram = fal
         clearTimeout(debounceTimerRef.current);
       }
 
-      debounceTimerRef.current = setTimeout(() => {
+      debounceTimerRef.current = setTimeout(async () => {
         if (!container) return; // Container might have unmounted
 
         // Double check hasRendered state inside timeout, in case it changed rapidly
         if (hasRendered) return;
+
+        // Dynamic import: mermaid stays out of both entries' first-load
+        // closure and is fetched only when a diagram is actually rendered.
+        let mermaid: Awaited<ReturnType<typeof loadMermaid>>;
+        try {
+          mermaid = await loadMermaid();
+        } catch (loadError) {
+          // The renderer itself could not be fetched — a deploy invalidated
+          // the hashed chunk mid-session, an offline tab, a flaky network.
+          //
+          // This MUST write something visible, like the two render-failure
+          // paths below. Nothing has been put in the container yet (the
+          // loading indicator is set only after this await), the effect's
+          // dependencies cannot change again once the message settles, so
+          // nothing retries, and the plain-text fallback branch in the
+          // render body only runs while `renderAsDiagram` is false. A bare
+          // return therefore leaves a permanently blank gap where a diagram
+          // belongs, with the source unreachable too.
+          console.error('Failed to load mermaid:', loadError);
+          if (mermaidRef.current === container) {
+            const errorMessage =
+              loadError instanceof Error ? loadError.message : String(loadError);
+            const fallbackPre = document.createElement('pre');
+            fallbackPre.className = 'text-red-500 text-xs whitespace-pre-wrap break-words';
+            fallbackPre.textContent = `Mermaid renderer failed to load: ${errorMessage}\n\nContent:\n${String(children).replace(/\n$/, '').trim()}`;
+            container.innerHTML = '';
+            container.appendChild(fallbackPre);
+          }
+          return;
+        }
+        if (mermaidRef.current !== container || hasRendered) return;
 
         try {
           // Initialize mermaid config
           mermaid.initialize({
             startOnLoad: false,
             theme: theme === 'dark' ? 'dark' : 'default',
-            securityLevel: 'loose',
+            // 'loose' disables mermaid's built-in DOMPurify output sanitization
+            // and enables HTML labels / click JS; since the rendered SVG is
+            // injected via innerHTML below, an attacker-controlled ```mermaid```
+            // block in answer content would be a script sink. 'strict' makes
+            // mermaid sanitize its output and disable interaction
+            // (GHSA-xpjq-3w4w-w5wr).
+            securityLevel: 'strict',
             suppressErrorRendering: true,
           });
 

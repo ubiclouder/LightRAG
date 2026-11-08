@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { FileRejection } from 'react-dropzone'
 import Button from '@/components/ui/Button'
 import {
@@ -11,22 +11,62 @@ import {
 } from '@/components/ui/Dialog'
 import FileUploader from '@/components/ui/FileUploader'
 import { toast } from 'sonner'
+import { supportedFileTypes } from '@/lib/constants'
+import {
+  deriveUploaderInputs,
+  flattenAcceptExtensions,
+  formatFileTypesLabel,
+  normalizeSupportedFileTypes,
+  type FileTypesState
+} from '@/lib/fileTypes'
 import { errorMessage } from '@/lib/utils'
-import { uploadDocument } from '@/api/lightrag'
+import { getSupportedFileTypes, uploadDocument } from '@/api/lightrag'
 
 import { UploadIcon } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 interface UploadDocumentsDialogProps {
   onDocumentsUploaded?: () => Promise<void>
+  /**
+   * Fired once per batch as soon as the first file is accepted by the server.
+   * Lets the parent start its activity probe as early as possible (rather
+   * than waiting for the whole sequential batch to finish).
+   */
+  onUploadBatchAccepted?: () => void
 }
 
-export default function UploadDocumentsDialog({ onDocumentsUploaded }: UploadDocumentsDialogProps) {
+export default function UploadDocumentsDialog({
+  onDocumentsUploaded,
+  onUploadBatchAccepted
+}: UploadDocumentsDialogProps) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
   const [isUploading, setIsUploading] = useState(false)
   const [progresses, setProgresses] = useState<Record<string, number>>({})
   const [fileErrors, setFileErrors] = useState<Record<string, string>>({})
+  const [fileTypes, setFileTypes] = useState<FileTypesState>({ status: 'idle' })
+
+  // Fetch the live allowlist + engine capability matrix while the dialog is
+  // open. `loading` is entered synchronously in onOpenChange (not here) so
+  // the very first open render already has the uploader disabled.
+  useEffect(() => {
+    if (!open) return
+    const controller = new AbortController()
+    getSupportedFileTypes(controller.signal)
+      .then((res) => {
+        if (controller.signal.aborted) return
+        const data = normalizeSupportedFileTypes(res)
+        setFileTypes(data ? { status: 'ready', data } : { status: 'fallback' })
+      })
+      .catch((err) => {
+        if (controller.signal.aborted) return
+        // Old backend (404) or transient failure: fall back to the static
+        // allowlist and let the server judge hinted filenames.
+        console.warn('Failed to fetch supported file types:', errorMessage(err))
+        setFileTypes({ status: 'fallback' })
+      })
+    return () => controller.abort()
+  }, [open])
 
   const handleRejectedFiles = useCallback(
     (rejectedFiles: FileRejection[]) => {
@@ -76,6 +116,7 @@ export default function UploadDocumentsDialog({ onDocumentsUploaded }: UploadDoc
       try {
         // Track errors locally to ensure we have the final state
         const uploadErrors: Record<string, string> = {}
+        let batchProbeTriggered = false
 
         // Create a collator that supports Chinese sorting
         const collator = new Intl.Collator(['zh-CN', 'en'], {
@@ -103,13 +144,7 @@ export default function UploadDocumentsDialog({ onDocumentsUploaded }: UploadDoc
               }))
             })
 
-            if (result.status === 'duplicated') {
-              uploadErrors[file.name] = t('documentPanel.uploadDocuments.fileUploader.duplicateFile')
-              setFileErrors(prev => ({
-                ...prev,
-                [file.name]: t('documentPanel.uploadDocuments.fileUploader.duplicateFile')
-              }))
-            } else if (result.status !== 'success') {
+            if (result.status !== 'success') {
               uploadErrors[file.name] = result.message
               setFileErrors(prev => ({
                 ...prev,
@@ -118,19 +153,45 @@ export default function UploadDocumentsDialog({ onDocumentsUploaded }: UploadDoc
             } else {
               // Mark that we had at least one successful upload
               hasSuccessfulUpload = true
+              if (!batchProbeTriggered) {
+                batchProbeTriggered = true
+                onUploadBatchAccepted?.()
+              }
             }
           } catch (err) {
             console.error(`Upload failed for ${file.name}:`, err)
 
             // Handle HTTP errors, including 400 errors
             let errorMsg = errorMessage(err)
+            const duplicateFileMsg = t('documentPanel.uploadDocuments.fileUploader.duplicateFile')
 
             // If it's an axios error with response data, try to extract more detailed error info
             if (err && typeof err === 'object' && 'response' in err) {
               const axiosError = err as { response?: { status: number, data?: { detail?: string } } }
-              if (axiosError.response?.status === 400) {
-                // Extract specific error message from backend response
-                errorMsg = axiosError.response.data?.detail || errorMsg
+              const status = axiosError.response?.status
+              const detail = axiosError.response?.data?.detail
+              if (status === 409) {
+                // Server now rejects same-name uploads with HTTP 409 instead of
+                // returning a 200 ``status="duplicated"`` payload.  Map the most
+                // common cases (existing record / file in INPUT dir) back to the
+                // dedicated "duplicate file" UI affordance, and surface other
+                // 409 reasons (pipeline busy / scanning) verbatim from the
+                // server detail so users can tell why they were rejected.
+                if (
+                  typeof detail === 'string' &&
+                  (/already contains/i.test(detail) || /Status:/i.test(detail))
+                ) {
+                  errorMsg = duplicateFileMsg
+                } else {
+                  errorMsg = detail || errorMsg
+                }
+              } else if (status === 400 || status === 413 || status === 429 || status === 503) {
+                // 400 invalid request, 413 body/file too large, 429 pipeline at
+                // capacity (MAX_PENDING_DOCUMENTS — the detail carries how many
+                // documents are active, how many were requested, the capacity and
+                // a retry hint), 503 document storage unavailable. Each detail is
+                // written to be shown to a user verbatim.
+                errorMsg = detail || errorMsg
               }
 
               // Set progress to 100% to display error message
@@ -175,21 +236,29 @@ export default function UploadDocumentsDialog({ onDocumentsUploaded }: UploadDoc
         setIsUploading(false)
       }
     },
-    [setIsUploading, setProgresses, setFileErrors, t, onDocumentsUploaded]
+    [setIsUploading, setProgresses, setFileErrors, t, onDocumentsUploaded, onUploadBatchAccepted]
   )
+
+  const uploaderInputs = deriveUploaderInputs(fileTypes)
 
   return (
     <Dialog
       open={open}
-      onOpenChange={(open) => {
+      onOpenChange={(nextOpen) => {
         if (isUploading) {
           return
         }
-        if (!open) {
+        if (nextOpen) {
+          // Enter loading synchronously so the first open render already has
+          // the uploader disabled — no window where a hinted file could start
+          // uploading before the capability matrix arrives.
+          setFileTypes({ status: 'loading' })
+        } else {
           setProgresses({})
           setFileErrors({})
+          setFileTypes({ status: 'idle' })
         }
-        setOpen(open)
+        setOpen(nextOpen)
       }}
     >
       <DialogTrigger asChild>
@@ -207,12 +276,18 @@ export default function UploadDocumentsDialog({ onDocumentsUploaded }: UploadDoc
         <FileUploader
           maxFileCount={Infinity}
           maxSize={200 * 1024 * 1024}
-          description={t('documentPanel.uploadDocuments.fileTypes')}
+          description={t('documentPanel.uploadDocuments.fileTypes', {
+            types: formatFileTypesLabel(
+              uploaderInputs.acceptedExtensions ?? flattenAcceptExtensions(supportedFileTypes)
+            )
+          })}
           onUpload={handleDocumentsUpload}
           onReject={handleRejectedFiles}
           progresses={progresses}
           fileErrors={fileErrors}
-          disabled={isUploading}
+          disabled={isUploading || uploaderInputs.disabled}
+          acceptedExtensions={uploaderInputs.acceptedExtensions}
+          engineCapabilities={uploaderInputs.engineCapabilities}
         />
       </DialogContent>
     </Dialog>

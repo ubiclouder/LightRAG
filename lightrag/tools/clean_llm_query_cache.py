@@ -2,7 +2,7 @@
 """
 LLM Query Cache Cleanup Tool for LightRAG
 
-This tool cleans up LLM query cache (mix:*, hybrid:*, local:*, global:*)
+This tool cleans up LLM query cache (mix:*, hybrid:*, local:*, global:*, naive:*)
 from KV storage implementations while preserving workspace isolation.
 
 Usage:
@@ -15,6 +15,7 @@ Supported KV Storage Types:
     - RedisKVStorage
     - PGKVStorage
     - MongoKVStorage
+    - OpenSearchKVStorage
 """
 
 import asyncio
@@ -47,6 +48,7 @@ STORAGE_TYPES = {
     "2": "RedisKVStorage",
     "3": "PGKVStorage",
     "4": "MongoKVStorage",
+    "5": "OpenSearchKVStorage",
 }
 
 # Workspace environment variable mapping
@@ -54,10 +56,13 @@ WORKSPACE_ENV_MAP = {
     "PGKVStorage": "POSTGRES_WORKSPACE",
     "MongoKVStorage": "MONGODB_WORKSPACE",
     "RedisKVStorage": "REDIS_WORKSPACE",
+    "OpenSearchKVStorage": "OPENSEARCH_WORKSPACE",
 }
 
-# Query cache modes
-QUERY_MODES = ["mix", "hybrid", "local", "global"]
+# Query cache modes. Must cover every QueryParam.mode that reaches the LLM cache,
+# i.e. all of them except "bypass", which answers straight from the LLM and writes
+# no cache entry. Entries for a mode missing here are neither counted nor deleted.
+QUERY_MODES = ["mix", "hybrid", "local", "global", "naive"]
 
 # Query cache types
 CACHE_TYPES = ["query", "keywords"]
@@ -170,6 +175,8 @@ class CleanupTool:
                 return config.has_option("mongodb", "uri") and config.has_option(
                     "mongodb", "database"
                 )
+            elif storage_name == "OpenSearchKVStorage":
+                return config.has_option("opensearch", "hosts")
 
             return False
         except Exception:
@@ -234,6 +241,10 @@ class CleanupTool:
             from lightrag.kg.mongo_impl import MongoKVStorage
 
             return MongoKVStorage
+        elif storage_name == "OpenSearchKVStorage":
+            from lightrag.kg.opensearch_impl import OpenSearchKVStorage
+
+            return OpenSearchKVStorage
         else:
             raise ValueError(f"Unsupported storage type: {storage_name}")
 
@@ -388,6 +399,29 @@ class CleanupTool:
 
         return counts
 
+    async def count_query_caches_opensearch(self, storage) -> Dict[str, Dict[str, int]]:
+        """Count query caches in OpenSearch by mode and cache_type."""
+        counts = {mode: {"query": 0, "keywords": 0} for mode in QUERY_MODES}
+
+        print("Scanning OpenSearch documents...", end="", flush=True)
+        start_time = time.time()
+
+        async for hits in storage._iter_raw_docs(batch_size=DEFAULT_BATCH_SIZE):
+            for hit in hits:
+                key = hit["_id"]
+                for mode in QUERY_MODES:
+                    if key.startswith(f"{mode}:query:"):
+                        counts[mode]["query"] += 1
+                    elif key.startswith(f"{mode}:keywords:"):
+                        counts[mode]["keywords"] += 1
+
+        elapsed = time.time() - start_time
+        if elapsed > 1:
+            print(f" (took {elapsed:.1f}s)", end="")
+        print()
+
+        return counts
+
     async def count_query_caches(
         self, storage, storage_name: str
     ) -> Dict[str, Dict[str, int]]:
@@ -408,6 +442,8 @@ class CleanupTool:
             return await self.count_query_caches_pg(storage)
         elif storage_name == "MongoKVStorage":
             return await self.count_query_caches_mongo(storage)
+        elif storage_name == "OpenSearchKVStorage":
+            return await self.count_query_caches_opensearch(storage)
         else:
             raise ValueError(f"Unsupported storage type: {storage_name}")
 
@@ -463,7 +499,9 @@ class CleanupTool:
 
                 # CRITICAL: Set update flag so changes persist to disk
                 # Without this, deletions remain in-memory only and are lost on exit
-                await set_all_update_flags(storage.final_namespace)
+                await set_all_update_flags(
+                    storage.namespace, workspace=storage.workspace
+                )
 
                 # Success
                 stats.successful_batches += 1
@@ -662,6 +700,68 @@ class CleanupTool:
 
         print(f"\nTotal deleted: {total_deleted:,} records")
 
+    async def delete_query_caches_opensearch(
+        self, storage, cleanup_type: str, stats: CleanupStats
+    ):
+        """Delete query caches from OpenSearchKVStorage."""
+        keys_to_delete = []
+
+        async for hits in storage._iter_raw_docs(batch_size=self.batch_size):
+            for hit in hits:
+                key = hit["_id"]
+                should_delete = False
+                for mode in QUERY_MODES:
+                    if cleanup_type == "all":
+                        if key.startswith(f"{mode}:query:") or key.startswith(
+                            f"{mode}:keywords:"
+                        ):
+                            should_delete = True
+                    elif cleanup_type == "query":
+                        if key.startswith(f"{mode}:query:"):
+                            should_delete = True
+                    elif cleanup_type == "keywords":
+                        if key.startswith(f"{mode}:keywords:"):
+                            should_delete = True
+
+                if should_delete:
+                    keys_to_delete.append(key)
+
+        total_keys = len(keys_to_delete)
+        stats.total_batches = (total_keys + self.batch_size - 1) // self.batch_size
+
+        print("\n=== Starting Cleanup ===")
+        print(
+            f"💡 Processing {self.batch_size:,} records at a time from OpenSearchKVStorage\n"
+        )
+
+        for batch_idx in range(stats.total_batches):
+            start_idx = batch_idx * self.batch_size
+            end_idx = min((batch_idx + 1) * self.batch_size, total_keys)
+            batch_keys = keys_to_delete[start_idx:end_idx]
+
+            try:
+                await storage.delete(batch_keys)
+                stats.successful_batches += 1
+                stats.successfully_deleted += len(batch_keys)
+
+                progress = (stats.successfully_deleted / total_keys) * 100
+                bar_length = 20
+                filled_length = int(
+                    bar_length * stats.successfully_deleted // total_keys
+                )
+                bar = "█" * filled_length + "░" * (bar_length - filled_length)
+
+                print(
+                    f"Batch {batch_idx + 1}/{stats.total_batches}: {bar} "
+                    f"{stats.successfully_deleted:,}/{total_keys:,} ({progress:.1f}%) ✓"
+                )
+            except Exception as e:
+                stats.add_error(batch_idx + 1, e, len(batch_keys))
+                print(
+                    f"Batch {batch_idx + 1}/{stats.total_batches}: ✗ FAILED - "
+                    f"{type(e).__name__}: {str(e)}"
+                )
+
     async def delete_query_caches(
         self, storage, storage_name: str, cleanup_type: str, stats: CleanupStats
     ):
@@ -681,6 +781,8 @@ class CleanupTool:
             await self.delete_query_caches_pg(storage, cleanup_type, stats)
         elif storage_name == "MongoKVStorage":
             await self.delete_query_caches_mongo(storage, cleanup_type, stats)
+        elif storage_name == "OpenSearchKVStorage":
+            await self.delete_query_caches_opensearch(storage, cleanup_type, stats)
         else:
             raise ValueError(f"Unsupported storage type: {storage_name}")
 
@@ -852,10 +954,13 @@ class CleanupTool:
         print("\n=== Storage Setup ===")
         self.print_storage_types()
 
+        num_options = len(STORAGE_TYPES)
+        prompt_range = "1" if num_options == 1 else f"1-{num_options}"
+
         # Custom input handling with exit support
         while True:
             choice = input(
-                "\nSelect storage type (1-4) (Press Enter to exit): "
+                f"\nSelect storage type ({prompt_range}) (Press Enter to exit): "
             ).strip()
 
             # Check for exit
@@ -909,6 +1014,7 @@ class CleanupTool:
         print("\nInitializing storage...")
         try:
             storage = await self.initialize_storage(storage_name, workspace)
+            workspace = storage.workspace
             print(f"- Storage Type: {storage_name}")
             print(f"- Workspace: {workspace if workspace else '(default)'}")
             print("- Connection Status: ✓ Success")
@@ -938,6 +1044,9 @@ class CleanupTool:
                 print("     [mongodb]")
                 print("     uri = mongodb://root:root@localhost:27017/")
                 print("     database = LightRAG")
+            elif storage_name == "OpenSearchKVStorage":
+                print("     [opensearch]")
+                print("     hosts = localhost:9200")
 
             return None, None, None
 
@@ -1127,11 +1236,16 @@ class CleanupTool:
                 pass
 
 
-async def main():
-    """Main entry point"""
+async def async_main():
+    """Async main entry point"""
     tool = CleanupTool()
     await tool.run()
 
 
+def main():
+    """Synchronous entry point for CLI command"""
+    asyncio.run(async_main())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

@@ -7,7 +7,7 @@
 ### Core Metrics
 
 | Metric | What It Measures | Good Score |
-|--------|-----------------|-----------|
+| ------ | ---------------- | ---------- |
 | **Faithfulness** | Is the answer factually accurate based on retrieved context? | > 0.80 |
 | **Answer Relevance** | Is the answer relevant to the user's question? | > 0.80 |
 | **Context Recall** | Was all relevant information retrieved from documents? | > 0.80 |
@@ -53,6 +53,15 @@ pip install -e ".[evaluation]"
 ```
 
 ### 2. Run Evaluation
+
+**Optional offline sample retrieval check (no API/model calls):**
+```bash
+python lightrag/evaluation/offline_retrieval_check.py --strict
+```
+
+This checks whether the bundled sample questions can lexically retrieve their
+expected sample documents before running LightRAG, embeddings, LLM calls, or
+RAGAS.
 
 **Basic usage (uses defaults):**
 ```bash
@@ -103,7 +112,7 @@ results/
 The evaluation script supports command-line arguments for easy configuration:
 
 | Argument | Short | Default | Description |
-|----------|-------|---------|-------------|
+| -------- | ----- | ------- | ----------- |
 | `--dataset` | `-d` | `sample_dataset.json` | Path to test dataset JSON file |
 | `--ragendpoint` | `-r` | `http://localhost:9621` or `$LIGHTRAG_API_URL` | LightRAG API endpoint URL |
 
@@ -153,7 +162,7 @@ The evaluation framework supports customization through environment variables:
 - Non-compatible endpoints will cause evaluation failures
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+| -------- | ------- | ----------- |
 | **LLM Configuration** | | |
 | `EVAL_LLM_MODEL` | `gpt-4o-mini` | LLM model used for RAGAS evaluation |
 | `EVAL_LLM_BINDING_API_KEY` | falls back to `OPENAI_API_KEY` | API key for LLM evaluation |
@@ -262,7 +271,7 @@ EVAL_LLM_TIMEOUT=180     # 3-minute timeout per request
 **Common Issues and Solutions:**
 
 | Issue | Solution |
-|-------|----------|
+| ----- | -------- |
 | **Warning: "LM returned 1 generations instead of 3"** | Reduce `EVAL_MAX_CONCURRENT` to 1 or decrease `EVAL_QUERY_TOP_K` |
 | **Context Precision returns NaN** | Lower `EVAL_QUERY_TOP_K` to reduce LLM calls per test case |
 | **Rate limit errors (429)** | Increase `EVAL_LLM_MAX_RETRIES` and decrease `EVAL_MAX_CONCURRENT` |
@@ -302,7 +311,7 @@ EVAL_LLM_TIMEOUT=180     # 3-minute timeout per request
 ### What Low Scores Mean
 
 | Metric | Low Score Indicates |
-|--------|-------------------|
+| ------ | ------------------- |
 | **Faithfulness** | Responses contain hallucinations or incorrect information |
 | **Answer Relevance** | Answers don't match what users asked |
 | **Context Recall** | Missing important information in retrieval |

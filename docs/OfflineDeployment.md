@@ -12,6 +12,7 @@ If you deploy LightRAG using Docker, there is no need to refer to this document,
 - [Quick Start](#quick-start)
 - [Layered Dependencies](#layered-dependencies)
 - [Tiktoken Cache Management](#tiktoken-cache-management)
+- [spaCy Models for Native docx smart_heading (Optional)](#spacy-models-for-native-docx-smart_heading-optional)
 - [Complete Offline Deployment Workflow](#complete-offline-deployment-workflow)
 - [Troubleshooting](#troubleshooting)
 
@@ -75,7 +76,7 @@ LightRAG provides flexible dependency groups for different use cases:
 ### Available Dependency Groups
 
 | Group | Description | Use Case |
-|-------|-------------|----------|
+| ----- | ----------- | -------- |
 | `api` | API server + document processing | FastAPI server with PDF, DOCX, PPTX, XLSX support |
 | `offline-storage` | Storage backends | Redis, Neo4j, MongoDB, PostgreSQL, etc. |
 | `offline-llm` | LLM providers | OpenAI, Anthropic, Ollama, etc. |
@@ -120,7 +121,7 @@ Tiktoken downloads BPE encoding models on first use. In offline environments, yo
 After installing LightRAG, use the built-in command:
 
 ```bash
-# Download to default location (~/.tiktoken_cache)
+# Download to default location (see output for exact path)
 lightrag-download-cache
 
 # Download to specific directory
@@ -152,6 +153,58 @@ source ~/.bashrc
 
 # Option 3: Copy to default location
 cp -r /path/to/tiktoken_cache ~/.tiktoken_cache/
+```
+
+## spaCy Models for Native docx smart_heading (Optional)
+
+The native docx parser's opt-in `smart_heading` engine parameter uses spaCy for
+sentence/NER heuristics. Deployments that never enable `smart_heading` do NOT
+need any of this — the dependency is loaded lazily only when a document is
+parsed with `smart_heading=true`, and a missing model raises a hard error at
+that point (never silently degrades). Deployments that enable it globally
+(`DOCX_SMART_HEADING=true`) or via a `LIGHTRAG_PARSER` rule with
+`native(smart_heading=true)` get the check earlier: the server verifies the
+models at startup and fails fast with install guidance.
+
+Docker deployments need none of this section: the main LightRAG image bundles
+the spaCy runtime and both pinned models (the lite image ships the runtime
+only, so enabling `smart_heading` there still requires installing the models).
+The steps below apply to non-Docker pip deployments.
+
+The two language models are pinned to an exact version (`zh_core_web_sm` /
+`en_core_web_sm` 3.8.0) because smart_heading promises deterministic re-parse
+results; a model version drift would silently change its decisions. The zh
+model's tokenizer backend `spacy-pkuseg` is pinned and shipped with the model
+wheels for the same reason.
+
+### Prepare in Online Environment
+
+```bash
+# spaCy runtime (already included in the api extra)
+pip install lightrag-hku[api]
+# or: pip install -r requirements-offline-smart-heading.txt (runtime + models)
+
+# For offline transfer: download runtime + model wheels to ./packages
+pip download -r requirements-offline-smart-heading.txt -d ./packages
+
+# Or download only the pinned model wheels (to ./spacy_models by default) —
+# --spacy is independent of the tiktoken cache download, so this never
+# touches tiktoken
+lightrag-download-cache --spacy-dir ./spacy_models
+
+# Or install them straight into the current environment
+lightrag-download-cache --spacy-install
+```
+
+### Install in Offline Environment
+
+```bash
+# Install by name from the transferred wheel directory. Do NOT use
+# `-r requirements-offline-smart-heading.txt` here: its model pins are direct
+# GitHub URLs, which pip fetches from the network even under --no-index.
+pip install --no-index --find-links=./packages spacy zh_core_web_sm en_core_web_sm
+# or, with only the model wheels from lightrag-download-cache --spacy:
+pip install --no-index --find-links=./spacy_models zh_core_web_sm en_core_web_sm
 ```
 
 ## Complete Offline Deployment Workflow
@@ -216,7 +269,6 @@ python -c "from lightrag import LightRAG; print('✓ LightRAG imported')"
 python -c "from lightrag.utils import TiktokenTokenizer; t = TiktokenTokenizer(); print('✓ Tiktoken working')"
 
 # Test optional dependencies (if installed)
-python -c "import docling; print('✓ Docling available')"
 python -c "import redis; print('✓ Redis available')"
 ```
 
@@ -306,7 +358,7 @@ mkdir -p ~/my_tiktoken_cache
 
 - [LightRAG GitHub Repository](https://github.com/HKUDS/LightRAG)
 - [Docker Deployment Guide](./DockerDeployment.md)
-- [API Documentation](../lightrag/api/README.md)
+- [API Server Documentation](./LightRAG-API-Server.md)
 
 ## Support
 

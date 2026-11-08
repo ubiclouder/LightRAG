@@ -1,3 +1,5 @@
+import warnings
+
 import pipmaster as pm  # Pipmaster for dynamic library install
 
 # install specific modules
@@ -15,6 +17,8 @@ from tenacity import (
     wait_exponential,
     retry_if_exception_type,
 )
+
+from lightrag.utils import TruncatedResponse
 
 
 from functools import lru_cache
@@ -62,7 +66,14 @@ async def lmdeploy_model_if_cache(
     quant_policy=0,
     **kwargs,
 ) -> str:
-    """
+    """Run lmdeploy generation with LightRAG-compatible shims.
+
+    Structured output note:
+    - This adapter does not support OpenAI-style ``response_format`` JSON mode.
+    - If callers pass ``response_format``, it is stripped before generation.
+    - Deprecated ``keyword_extraction`` and ``entity_extraction`` booleans are
+      accepted only as compatibility shims; they emit warnings and are ignored.
+
     Args:
         model (str): The path to the model.
             It could be one of the following options:
@@ -102,8 +113,25 @@ async def lmdeploy_model_if_cache(
     except Exception:
         raise ImportError("Please install lmdeploy before initialize lmdeploy backend.")
     kwargs.pop("hashing_kv", None)
+    # lmdeploy has no JSON mode; drop response_format and warn when legacy
+    # boolean shim flags are set.
+    if kwargs.pop("keyword_extraction", False):
+        warnings.warn(
+            "lmdeploy_model_if_cache(keyword_extraction=True) is deprecated; "
+            "pass response_format={'type': 'json_object'} instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    if kwargs.pop("entity_extraction", False):
+        warnings.warn(
+            "lmdeploy_model_if_cache(entity_extraction=True) is deprecated; "
+            "pass response_format={'type': 'json_object'} instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     kwargs.pop("response_format", None)
-    max_new_tokens = kwargs.pop("max_tokens", 512)
+    max_tokens = kwargs.pop("max_tokens", 512)
+    max_new_tokens = kwargs.pop("max_new_tokens", max_tokens)
     tp = kwargs.pop("tp", 1)
     skip_special_tokens = kwargs.pop("skip_special_tokens", True)
     do_preprocess = kwargs.pop("do_preprocess", True)
@@ -114,10 +142,9 @@ async def lmdeploy_model_if_cache(
     if do_sample is not None and version < (0, 6, 0):
         raise RuntimeError(
             "`do_sample` parameter is not supported by lmdeploy until "
-            f"v0.6.0, but currently using lmdeloy {lmdeploy.__version__}"
+            f"v0.6.0, but currently using lmdeploy {lmdeploy.__version__}"
         )
     else:
-        do_sample = True
         gen_params.update(do_sample=do_sample)
 
     lmdeploy_pipe = initialize_lmdeploy_pipeline(
@@ -143,6 +170,7 @@ async def lmdeploy_model_if_cache(
     )
 
     response = ""
+    finish_reason = None
     async for res in lmdeploy_pipe.generate(
         messages,
         gen_config=gen_config,
@@ -150,5 +178,9 @@ async def lmdeploy_model_if_cache(
         stream_response=False,
         session_id=1,
     ):
-        response += res.response
+        response += getattr(res, "text", getattr(res, "response", ""))
+        if getattr(res, "finish_reason", None) is not None:
+            finish_reason = res.finish_reason
+    if finish_reason == "length":
+        return TruncatedResponse(response)
     return response
