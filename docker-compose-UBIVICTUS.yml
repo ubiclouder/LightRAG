@@ -1,0 +1,22 @@
+services:
+  lightrag:
+    container_name: lightrag_solo
+    image: ghcr.io/hkuds/lightrag:latest
+    network_mode: host
+    build:
+      context: .
+      dockerfile: Dockerfile
+      tags:
+        - ghcr.io/hkuds/lightrag:latest
+    ports:
+      - "${PORT:-9621}:9721"
+    volumes:
+      - ./data/rag_storage:/app/data/rag_storage
+      - ./data/inputs:/app/data/inputs
+      - ./config.ini:/app/config.ini
+      - ./.env:/app/.env
+    env_file:
+      - .env
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
